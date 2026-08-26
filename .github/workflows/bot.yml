@@ -58,14 +58,15 @@ jobs:
           git config user.name  "monitor-cssdeals"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Se nada mudou, nao ha o que salvar
-          if git diff --quiet -- vistos.txt 2>/dev/null && [ -f vistos.txt ]; then
+          # 'git add' cobre tanto arquivo novo quanto alterado.
+          # (Nao use 'git diff' antes do add: arquivo ainda nao rastreado
+          #  aparece como "sem mudancas" e o primeiro salvamento se perde.)
+          git add vistos.txt 2>/dev/null || true
+
+          if git diff --staged --quiet; then
             echo "Nenhum produto novo — nada a salvar."
             exit 0
           fi
-
-          git add vistos.txt
-          git diff --staged --quiet && echo "Sem mudancas." && exit 0
 
           git commit -m "memoria: $(date -u '+%d/%m/%Y %H:%M UTC')"
 
