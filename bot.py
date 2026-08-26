@@ -1,0 +1,1507 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Bot de coleta de dados (web scraping) com notificacao no Telegram e/ou Discord.
+
+COMO USAR (resumo — o passo a passo completo esta no README.md):
+
+    python3 bot.py --testar      # testa se a notificacao esta configurada certa
+    python3 bot.py               # roda a coleta UMA vez
+    python3 bot.py --loop        # roda a cada 15 minutos, sem parar
+
+Toda a configuracao sensivel (token do bot, id do grupo) vem do arquivo .env.
+NADA de senha ou token fica escrito dentro deste arquivo.
+"""
+
+from __future__ import annotations   # compatibilidade com Python 3.9
+
+import argparse
+import html
+import logging
+import os
+import re
+import sqlite3
+import sys
+import time
+import urllib.robotparser
+from datetime import datetime
+from typing import Optional
+from urllib.parse import urljoin, urlparse
+
+import requests
+from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+
+# ==========================================================================
+#  1. CONFIGURACAO DO SITE ALVO (cssdeals.com)
+# ==========================================================================
+#
+#  IMPORTANTE — POR QUE NAO PRECISAMOS VARRER ABA POR ABA:
+#
+#  O site tem dezenas de abas (Shoes, Hoodie, Pants...) e cada uma tem
+#  subabas de tamanho, com 20 produtos por pagina e as vezes 20+ paginas.
+#  Varrer tudo isso daria centenas de requisicoes a cada rodada.
+#
+#  Nao e necessario. O site tem uma API interna que devolve os produtos
+#  JA ORDENADOS DO MAIS NOVO PARA O MAIS ANTIGO, misturando todas as
+#  categorias e tamanhos. Como voce so quer LANCAMENTOS NOVOS, basta ler
+#  a primeira pagina dessa lista: o que apareceu de novo desde a ultima
+#  vez esta sempre no topo.
+#
+#  Resultado: 1 requisicao a cada 15 minutos, em vez de centenas — e
+#  mesmo assim nenhum lancamento escapa, de nenhuma categoria.
+# ==========================================================================
+
+SITE_BASE = "https://cssdeals.com"
+
+# Endereco da lista de produtos (a API interna do proprio site)
+API_PRODUTOS = SITE_BASE + "/api/product"
+
+# Quantos produtos ler por rodada (do mais novo para o mais antigo).
+# 50 da uma margem folgada: mesmo que o site cadastre varios produtos
+# em 15 minutos, nenhum passa despercebido.
+TAMANHO_PAGINA = 50
+
+# Pagina do link de compra de cada produto
+URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
+
+# Nome de cada plataforma de origem (vem no campo salePlatform)
+PLATAFORMAS = {1: "Taobao", 2: "Weidian", 3: "1688"}
+
+# Categorias do site — usado so para mostrar o nome na mensagem.
+# (levantado de https://cssdeals.com/api/category/tree)
+CATEGORIAS = {
+    "11": "Shoes", "12": "Coat", "14": "T-shirts", "15": "Pants",
+    "16": "Accessories", "18": "Fashion", "19": "Electronics",
+    "20": "Watches", "21": "Cell phone", "22": "Earphone",
+    "23": "Computer accessories", "24": "Audio & Video",
+    "26": "Hat&Bags", "27": "Belt&Glasses", "30": "Gloves& Scarf",
+    "31": "Underwear & Sleepwear", "32": "Hoodie", "33": "down jacket",
+    "34": "suit", "35": "long sleeve", "36": "sports goods",
+    "37": "toy", "38": "phone case", "39": "accessories",
+    "40": "socks", "41": "Accessories", "43": "sports goods",
+    "44": "perfume", "45": "suitcase",
+}
+
+
+# ==========================================================================
+#  2. CONFIGURACOES GERAIS
+# ==========================================================================
+
+BANCO_DADOS = "dados.db"          # arquivo SQLite onde tudo fica salvo
+ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
+INTERVALO_LOOP_MIN = 15           # minutos entre cada rodada no modo --loop
+DELAY_ENTRE_REQUISICOES = 1.5     # segundos de pausa entre paginas do site
+DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
+TIMEOUT = 30                      # segundos ate desistir de uma requisicao
+MAX_TENTATIVAS = 3                # quantas vezes tentar de novo se der erro
+MAX_NOTIFICACOES_POR_RODADA = 20  # trava de seguranca contra spam
+
+# --- Traducao dos titulos ---
+# Os titulos vem do site em chines e ingles. O bot traduz para portugues
+# usando o MyMemory, que e gratuito e NAO precisa de cadastro nem chave.
+API_TRADUCAO = "https://api.mymemory.translated.net/get"
+IDIOMA_DESTINO = "pt-BR"
+DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
+LIMITE_TEXTO_TRADUCAO = 480   # o MyMemory aceita ate ~500 caracteres por vez
+
+# User-Agent honesto: identifica o bot em vez de fingir ser um navegador.
+# Isso e boa pratica — o dono do site consegue ver quem esta acessando.
+USER_AGENT = "BotColetaPessoal/1.0 (uso pessoal; contato via Telegram)"
+
+
+# ==========================================================================
+#  3. LOG (mostra o progresso na tela e salva no arquivo bot.log)
+# ==========================================================================
+
+def configurar_log() -> logging.Logger:
+    logger = logging.getLogger("bot")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+
+    formato = logging.Formatter(
+        "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%d/%m/%Y %H:%M:%S"
+    )
+
+    # mostra na tela
+    tela = logging.StreamHandler(sys.stdout)
+    tela.setFormatter(formato)
+    logger.addHandler(tela)
+
+    # salva no arquivo
+    arquivo = logging.FileHandler(ARQUIVO_LOG, encoding="utf-8")
+    arquivo.setFormatter(formato)
+    logger.addHandler(arquivo)
+
+    return logger
+
+
+log = configurar_log()
+
+
+# ==========================================================================
+#  4. BANCO DE DADOS (SQLite) — guarda os itens e evita duplicatas
+# ==========================================================================
+
+def abrir_banco() -> sqlite3.Connection:
+    """Abre (ou cria, na primeira vez) o arquivo dados.db."""
+    conexao = sqlite3.connect(BANCO_DADOS)
+    conexao.execute(
+        """
+        CREATE TABLE IF NOT EXISTS itens (
+            id            TEXT PRIMARY KEY,   -- id do produto no proprio site
+            titulo        TEXT NOT NULL,      -- titulo original (chines/ingles)
+            titulo_pt     TEXT,               -- titulo traduzido para portugues
+            imagem        TEXT,
+            link          TEXT,
+            preco         TEXT,
+            categoria     TEXT,
+            plataforma    TEXT,
+            origem        TEXT,
+            visto_em      TEXT NOT NULL,      -- quando o bot viu pela 1a vez
+            notificado    INTEGER DEFAULT 0   -- 0 = ainda nao avisou, 1 = ja avisou
+        )
+        """
+    )
+    conexao.commit()
+    return conexao
+
+
+def banco_vazio(conexao: sqlite3.Connection) -> bool:
+    """Diz se e a primeirissima vez que o bot roda (banco ainda sem nada)."""
+    return conexao.execute("SELECT COUNT(*) FROM itens").fetchone()[0] == 0
+
+
+def item_ja_existe(conexao: sqlite3.Connection, item_id: str) -> bool:
+    cursor = conexao.execute("SELECT 1 FROM itens WHERE id = ?", (item_id,))
+    return cursor.fetchone() is not None
+
+
+def salvar_item(conexao: sqlite3.Connection, item: dict,
+                ja_notificado: bool = False) -> None:
+    """
+    Salva UM item e grava no disco na hora (commit).
+
+    Isso e o 'salvamento incremental': se o script travar no meio, tudo que
+    ja foi coletado ate ali continua salvo.
+
+    `ja_notificado=True` e usado so na primeira rodada, para registrar o que
+    ja existia no site sem te encher de mensagens.
+    """
+    conexao.execute(
+        """
+        INSERT OR IGNORE INTO itens
+            (id, titulo, titulo_pt, imagem, link, preco, categoria, plataforma,
+             origem, visto_em, notificado)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            item["id"], item["titulo"], item.get("titulo_pt", ""),
+            item["imagem"], item["link"],
+            item["preco"], item["categoria"], item["plataforma"], item["origem"],
+            datetime.now().isoformat(timespec="seconds"),
+            1 if ja_notificado else 0,
+        ),
+    )
+    conexao.commit()
+
+
+def buscar_pendentes(conexao: sqlite3.Connection) -> list:
+    """
+    Devolve os itens que ja estao salvos mas que AINDA NAO foram avisados.
+
+    Por que isso existe: se o .env estiver errado na primeira vez que voce
+    rodar, os itens sao salvos mas a mensagem falha. Sem esta funcao, eles
+    ficariam presos no banco para sempre e voce nunca seria avisado deles.
+    Assim, assim que voce arrumar o .env, o bot manda os atrasados.
+    """
+    cursor = conexao.execute(
+        """
+        SELECT id, titulo, titulo_pt, imagem, link, preco, categoria,
+               plataforma, origem
+        FROM itens WHERE notificado = 0 ORDER BY visto_em
+        """
+    )
+    return [
+        {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "imagem": l[3],
+         "link": l[4], "preco": l[5], "categoria": l[6], "plataforma": l[7],
+         "origem": l[8]}
+        for l in cursor.fetchall()
+    ]
+
+
+def marcar_notificado(conexao: sqlite3.Connection, item_id: str) -> None:
+    conexao.execute("UPDATE itens SET notificado = 1 WHERE id = ?", (item_id,))
+    conexao.commit()
+
+
+# ==========================================================================
+#  5. COLETA — baixar a pagina e extrair os dados
+# ==========================================================================
+
+def criar_sessao() -> requests.Session:
+    """
+    Prepara o 'navegador' do bot com retry automatico.
+
+    Se der timeout ou conexao recusada, ele tenta de novo ate 3 vezes,
+    esperando um pouco mais a cada tentativa (1s, 2s, 4s).
+    """
+    sessao = requests.Session()
+    sessao.headers.update({"User-Agent": USER_AGENT})
+
+    politica_retry = Retry(
+        total=MAX_TENTATIVAS,
+        backoff_factor=1,                      # espera 1s, 2s, 4s
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "HEAD"],
+    )
+    adaptador = HTTPAdapter(max_retries=politica_retry)
+    sessao.mount("https://", adaptador)
+    sessao.mount("http://", adaptador)
+    return sessao
+
+
+def robots_permite(url: str) -> bool:
+    """
+    Le o robots.txt do site e confere se o bot tem permissao de acessar.
+
+    E o equivalente a bater na porta antes de entrar. Se nao conseguir ler o
+    robots.txt, assume que pode (comportamento padrao da internet).
+    """
+    try:
+        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+        leitor = urllib.robotparser.RobotFileParser()
+        leitor.set_url(urljoin(base, "/robots.txt"))
+        leitor.read()
+        permitido = leitor.can_fetch(USER_AGENT, url)
+        if not permitido:
+            log.error("robots.txt do site PROIBE o acesso a %s — coleta cancelada.", url)
+        return permitido
+    except Exception as erro:
+        log.warning("Nao consegui ler o robots.txt (%s). Seguindo com cautela.", erro)
+        return True
+
+
+def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
+    """Baixa o HTML da pagina. Devolve None se falhar em todas as tentativas."""
+    try:
+        resposta = sessao.get(url, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        return resposta.text
+    except requests.exceptions.Timeout:
+        log.error("Timeout: o site demorou mais de %ss para responder.", TIMEOUT)
+    except requests.exceptions.ConnectionError:
+        log.error("Conexao recusada ou sem internet.")
+    except requests.exceptions.HTTPError as erro:
+        log.error("O site respondeu com erro: %s", erro)
+    except Exception as erro:
+        log.error("Erro inesperado ao baixar a pagina: %s", erro)
+    return None
+
+
+def buscar_lancamentos(sessao: requests.Session, categoria: str = "") -> Optional[list]:
+    """
+    Pergunta a API do site quais sao os produtos MAIS NOVOS.
+
+    A API ja devolve ordenado do mais recente para o mais antigo, entao a
+    primeira pagina e exatamente a lista de lancamentos.
+
+    Se `categoria` estiver vazio, traz lancamentos de TODAS as abas do site
+    (Shoes, Hoodie, Pants, etc) de uma vez so.
+    """
+    parametros = {
+        "fields": 1,
+        "categoryId": categoria,
+        "page": 1,
+        "pageSize": TAMANHO_PAGINA,
+        "priceMin": "0.00",
+        "priceMax": "99999.00",
+    }
+
+    try:
+        resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except requests.exceptions.Timeout:
+        log.error("Timeout: o site demorou mais de %ss para responder.", TIMEOUT)
+        return None
+    except requests.exceptions.ConnectionError:
+        log.error("Conexao recusada ou sem internet.")
+        return None
+    except requests.exceptions.HTTPError as erro:
+        log.error("O site respondeu com erro: %s", erro)
+        return None
+    except ValueError:
+        log.error("O site respondeu algo que nao e JSON (o layout pode ter mudado).")
+        return None
+    except Exception as erro:
+        log.error("Erro inesperado ao consultar a API: %s", erro)
+        return None
+
+    # A API sempre responde HTTP 200; o erro de verdade vem no campo "code"
+    if corpo.get("code") != 0:
+        log.error("A API recusou a consulta: %s", corpo.get("msg") or corpo.get("code"))
+        return None
+
+    dados = corpo.get("data") or {}
+    registros = dados.get("records") or []
+    total = dados.get("total")
+    if total is not None:
+        log.info("Catalogo do site tem %s produtos no total.", total)
+
+    return registros
+
+
+def montar_item(registro: dict) -> Optional[dict]:
+    """
+    Converte um produto cru da API no formato que o bot usa.
+
+    Pega os tres dados que voce pediu: titulo, primeira foto e link de compra.
+    Preco, categoria e plataforma vem junto de graca.
+    """
+    produto_id = str(registro.get("id") or "").strip()
+    if not produto_id:
+        return None
+
+    # Titulo: converte codigos de HTML (&#039 vira apostrofo, etc)
+    titulo = html.unescape(str(registro.get("title") or "").strip())
+    titulo = re.sub(r"\s+", " ", titulo)
+    if not titulo:
+        titulo = "(produto sem titulo)"
+
+    # Primeira foto: a imagem da primeira variacao do produto
+    skus = registro.get("skus") or []
+    primeiro_sku = skus[0] if skus else {}
+    imagem = str(primeiro_sku.get("image") or registro.get("thumbnail") or "").strip()
+
+    # Preco (a API devolve em yuan)
+    valor = primeiro_sku.get("price")
+    preco = f"CN¥ {valor}" if valor is not None else ""
+
+    return {
+        "id": produto_id,                                   # id do proprio site
+        "titulo": titulo,
+        "titulo_pt": "",                                    # preenchido depois
+        "imagem": imagem,
+        "link": URL_PRODUTO.format(id=produto_id),          # link de compra
+        "preco": preco,
+        "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
+        "plataforma": PLATAFORMAS.get(registro.get("salePlatform"), ""),
+        "origem": str(registro.get("sourceLink") or "").strip(),
+    }
+
+
+def extrair_itens(registros: list) -> list:
+    """Converte a lista crua da API em itens, descartando os invalidos."""
+    itens = []
+    for registro in registros:
+        item = montar_item(registro)
+        if item:
+            itens.append(item)
+    return itens
+
+
+# ==========================================================================
+#  4.5 MEMORIA EM ARQUIVO DE TEXTO  (para rodar hospedado fora do Mac)
+# ==========================================================================
+#  Quando o bot roda no GitHub Actions, o computador e apagado ao fim de
+#  cada rodada. O banco SQLite nao sobrevive — e, por ser um arquivo
+#  binario, versiona-lo a cada 15 minutos incharia o repositorio.
+#
+#  Entao neste modo a memoria vira um arquivo de texto simples: uma linha
+#  por produto ja avisado. Ocupa quase nada, o Git versiona bem e voce
+#  consegue abrir e ler se quiser.
+# ==========================================================================
+
+# Quantos ids guardar. A janela de leitura do site e de ~6 horas, entao
+# 1000 e MUITO mais do que o necessario para nunca repetir um aviso.
+MAX_IDS_ESTADO = 1000
+
+
+def carregar_estado(caminho: str) -> list:
+    """Le o arquivo de memoria. Se nao existir ainda, devolve lista vazia."""
+    if not os.path.exists(caminho):
+        return []
+    try:
+        with open(caminho, "r", encoding="utf-8") as arquivo:
+            return [l.strip() for l in arquivo if l.strip() and not l.startswith("#")]
+    except OSError as erro:
+        log.warning("Nao consegui ler %s (%s). Comecando do zero.", caminho, erro)
+        return []
+
+
+def salvar_estado(caminho: str, ids: list) -> None:
+    """
+    Grava a memoria, mantendo so os mais recentes.
+
+    Escreve primeiro num arquivo temporario e so depois substitui o
+    definitivo — assim, se faltar energia no meio, o arquivo antigo
+    continua intacto em vez de virar lixo.
+    """
+    recentes = ids[-MAX_IDS_ESTADO:]
+    temporario = caminho + ".tmp"
+    try:
+        with open(temporario, "w", encoding="utf-8") as arquivo:
+            arquivo.write("# Produtos que o bot ja avisou. Nao edite a mao.\n")
+            arquivo.write("\n".join(recentes) + "\n")
+        os.replace(temporario, caminho)
+    except OSError as erro:
+        log.error("Nao consegui gravar a memoria em %s: %s", caminho, erro)
+
+
+# ==========================================================================
+#  5.5 TRADUCAO DOS TITULOS
+# ==========================================================================
+#  Os produtos vem do Taobao/Weidian/1688, entao os titulos chegam em
+#  chines ou em ingles. Aqui eles viram portugues.
+#
+#  Cada traducao e guardada no banco. Se o mesmo titulo aparecer de novo,
+#  o bot usa a traducao salva em vez de pedir outra vez — isso economiza
+#  a cota do servico gratuito e deixa tudo mais rapido.
+# ==========================================================================
+
+# Fica True se a cota diaria acabar, para nao insistir a rodada inteira
+_traducao_indisponivel = False
+
+
+def criar_cache_traducao(conexao: sqlite3.Connection) -> None:
+    """Cria a tabelinha que guarda as traducoes ja feitas."""
+    conexao.execute(
+        """
+        CREATE TABLE IF NOT EXISTS traducoes (
+            original   TEXT PRIMARY KEY,
+            traduzido  TEXT NOT NULL
+        )
+        """
+    )
+    conexao.commit()
+
+
+# Cache em memoria, usado quando nao ha banco (modo GitHub Actions)
+_cache_memoria = {}
+
+
+def traducao_no_cache(conexao, texto: str) -> Optional[str]:
+    if conexao is None:
+        return _cache_memoria.get(texto)
+    linha = conexao.execute(
+        "SELECT traduzido FROM traducoes WHERE original = ?", (texto,)
+    ).fetchone()
+    return linha[0] if linha else None
+
+
+def guardar_traducao(conexao, texto: str, traduzido: str) -> None:
+    if conexao is None:
+        _cache_memoria[texto] = traduzido
+        return
+    conexao.execute(
+        "INSERT OR REPLACE INTO traducoes (original, traduzido) VALUES (?, ?)",
+        (texto, traduzido),
+    )
+    conexao.commit()
+
+
+def detectar_idioma(texto: str) -> str:
+    """
+    Descobre se o titulo esta em chines ou em ingles.
+
+    Simples e eficaz: se tiver ideograma chines no meio, e chines.
+    """
+    for caractere in texto:
+        if "\u4e00" <= caractere <= "\u9fff":   # faixa dos ideogramas chineses
+            return "zh-CN"
+    return "en"
+
+
+def traduzir(texto: str, conexao, email: str = "") -> str:
+    """
+    Traduz um titulo para portugues.
+
+    Se qualquer coisa der errado (sem internet, cota esgotada, servico fora
+    do ar), devolve o titulo ORIGINAL em vez de quebrar. Voce nunca deixa de
+    receber a notificacao por causa da traducao.
+    """
+    global _traducao_indisponivel
+
+    texto = (texto or "").strip()
+    if not texto:
+        return texto
+
+    # 1) Ja traduzimos esse titulo antes?
+    salva = traducao_no_cache(conexao, texto)
+    if salva is not None:
+        return salva
+
+    # 2) A cota acabou nesta rodada? Nao adianta tentar de novo.
+    if _traducao_indisponivel:
+        return texto
+
+    recorte = texto[:LIMITE_TEXTO_TRADUCAO]
+    parametros = {
+        "q": recorte,
+        "langpair": "{}|{}".format(detectar_idioma(texto), IDIOMA_DESTINO),
+    }
+    if email:
+        parametros["de"] = email      # informar um e-mail aumenta a cota diaria
+
+    try:
+        resposta = requests.get(
+            API_TRADUCAO, params=parametros,
+            headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT,
+        )
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except Exception as erro:
+        log.warning("Traducao falhou (%s). Mantendo o titulo original.", erro)
+        return texto
+
+    # Cota diaria estourada
+    if corpo.get("quotaFinished"):
+        _traducao_indisponivel = True
+        log.warning(
+            "A cota diaria de traducao acabou. Os titulos continuam chegando, "
+            "so que no idioma original. Volta ao normal amanha. "
+            "(Dica: preencher TRADUCAO_EMAIL no .env aumenta bastante a cota.)"
+        )
+        return texto
+
+    if corpo.get("responseStatus") != 200:
+        log.warning(
+            "Servico de traducao recusou: %s. Mantendo o titulo original.",
+            str(corpo.get("responseDetails"))[:100],
+        )
+        return texto
+
+    traduzido = str((corpo.get("responseData") or {}).get("translatedText") or "").strip()
+    if not traduzido:
+        return texto
+
+    # O MyMemory as vezes devolve um aviso em vez da traducao
+    if "QUERY LENGTH LIMIT" in traduzido.upper() or "INVALID" in traduzido.upper():
+        return texto
+
+    guardar_traducao(conexao, texto, traduzido)
+    time.sleep(DELAY_ENTRE_TRADUCOES)
+    return traduzido
+
+
+# ==========================================================================
+#  6. NOTIFICACOES — Telegram e Discord
+# ==========================================================================
+
+def titulo_visivel(item: dict) -> str:
+    """Titulo em portugues quando existe; senao, o original."""
+    return (item.get("titulo_pt") or "").strip() or item["titulo"]
+
+
+def montar_texto_telegram(item: dict) -> str:
+    """Monta a mensagem no formato HTML do Telegram (negrito, link clicavel)."""
+    linhas = ["\U0001F195 <b>{}</b>".format(escapar_html(titulo_visivel(item)))]
+
+    # Mostra o titulo original tambem — util para procurar o produto no site
+    original = item["titulo"]
+    if original and original != titulo_visivel(item):
+        linhas.append("<i>{}</i>".format(escapar_html(original)))
+
+    etiquetas = [e for e in (item.get("categoria"), item.get("plataforma")) if e]
+    if etiquetas:
+        linhas.append(escapar_html(" · ".join(etiquetas)))
+
+    if item.get("preco"):
+        linhas.append("Preco: <b>{}</b>".format(escapar_html(item["preco"])))
+
+    if item.get("link"):
+        linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
+
+    return "\n".join(linhas)
+
+
+def escapar_html(texto: str) -> str:
+    """Protege caracteres especiais para nao quebrar a formatacao do Telegram."""
+    return texto.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def enviar_telegram(item: dict, token: str, chat_id: str) -> bool:
+    """
+    Envia UM item para o grupo do Telegram.
+
+    Se o item tem foto, manda a foto com legenda. Se nao tem (ou se a foto
+    falhar), manda so o texto. Devolve True se conseguiu enviar.
+    """
+    texto = montar_texto_telegram(item)
+    base = f"https://api.telegram.org/bot{token}"
+
+    # Tentativa 1: mandar com a foto
+    if item["imagem"]:
+        ok = _post_telegram(
+            f"{base}/sendPhoto",
+            {
+                "chat_id": chat_id,
+                "photo": item["imagem"],
+                "caption": texto,
+                "parse_mode": "HTML",
+            },
+        )
+        if ok:
+            return True
+        log.warning("Nao deu para mandar a foto. Tentando so com texto...")
+
+    # Tentativa 2 (ou unica): so texto
+    return _post_telegram(
+        f"{base}/sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": texto,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        },
+    )
+
+
+def _post_telegram(url: str, dados: dict) -> bool:
+    """
+    Faz o envio de fato e trata os erros SEM derrubar o script.
+
+    Erros tratados:
+      - 429 (rate limit): espera o tempo que o Telegram pedir e tenta de novo
+      - 403 (bot sem permissao no grupo): avisa no log e segue
+      - qualquer outro: loga e segue
+    """
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            resposta = requests.post(url, data=dados, timeout=TIMEOUT)
+
+            if resposta.status_code == 200:
+                return True
+
+            corpo = resposta.json() if resposta.content else {}
+            descricao = corpo.get("description", resposta.text[:200])
+
+            # Rate limit: o Telegram diz quantos segundos esperar
+            if resposta.status_code == 429:
+                espera = corpo.get("parameters", {}).get("retry_after", 5)
+                log.warning("Limite do Telegram atingido. Esperando %ss...", espera)
+                time.sleep(espera + 1)
+                continue
+
+            # Bot sem permissao / expulso do grupo — nao adianta insistir
+            if resposta.status_code in (401, 403):
+                log.error(
+                    "TELEGRAM SEM PERMISSAO (%s): %s "
+                    "-> Confira se o bot foi adicionado ao grupo e se o "
+                    "TELEGRAM_CHAT_ID esta correto.",
+                    resposta.status_code, descricao,
+                )
+                return False
+
+            if resposta.status_code == 400:
+                log.error("TELEGRAM recusou a mensagem (400): %s", descricao)
+                return False
+
+            log.warning(
+                "Telegram devolveu erro %s (tentativa %s/%s): %s",
+                resposta.status_code, tentativa, MAX_TENTATIVAS, descricao,
+            )
+            time.sleep(2 * tentativa)
+
+        except requests.exceptions.RequestException as erro:
+            log.warning(
+                "Falha de rede ao falar com o Telegram (tentativa %s/%s): %s",
+                tentativa, MAX_TENTATIVAS, erro,
+            )
+            time.sleep(2 * tentativa)
+
+    log.error("Desisti de enviar esta mensagem no Telegram apos %s tentativas.", MAX_TENTATIVAS)
+    return False
+
+
+def enviar_discord(item: dict, webhook_url: str) -> bool:
+    """
+    Envia UM item para o canal do Discord usando um Webhook.
+
+    O Discord monta um card bonito (embed) com titulo, link e foto.
+    """
+    embed = {
+        "title": titulo_visivel(item)[:250],
+        "color": 0x00B37E,   # verdinho
+    }
+    if item.get("link"):
+        embed["url"] = item["link"]
+    if item.get("imagem"):
+        embed["image"] = {"url": item["imagem"]}
+
+    detalhes = []
+    original = item["titulo"]
+    if original and original != titulo_visivel(item):
+        detalhes.append("*{}*".format(original[:200]))
+    if item.get("preco"):
+        detalhes.append("**{}**".format(item["preco"]))
+    etiquetas = [e for e in (item.get("categoria"), item.get("plataforma")) if e]
+    if etiquetas:
+        detalhes.append(" · ".join(etiquetas))
+    if detalhes:
+        embed["description"] = "\n".join(detalhes)
+
+    for tentativa in range(1, MAX_TENTATIVAS + 1):
+        try:
+            resposta = requests.post(
+                webhook_url, json={"embeds": [embed]}, timeout=TIMEOUT
+            )
+
+            if resposta.status_code in (200, 204):
+                return True
+
+            # Rate limit do Discord
+            if resposta.status_code == 429:
+                corpo = resposta.json() if resposta.content else {}
+                espera = float(corpo.get("retry_after", 5))
+                log.warning("Limite do Discord atingido. Esperando %.1fs...", espera)
+                time.sleep(espera + 1)
+                continue
+
+            if resposta.status_code in (401, 403, 404):
+                log.error(
+                    "DISCORD recusou (%s) -> a URL do webhook parece invalida "
+                    "ou foi apagada. Gere um webhook novo no canal.",
+                    resposta.status_code,
+                )
+                return False
+
+            log.warning(
+                "Discord devolveu erro %s (tentativa %s/%s): %s",
+                resposta.status_code, tentativa, MAX_TENTATIVAS, resposta.text[:200],
+            )
+            time.sleep(2 * tentativa)
+
+        except requests.exceptions.RequestException as erro:
+            log.warning(
+                "Falha de rede ao falar com o Discord (tentativa %s/%s): %s",
+                tentativa, MAX_TENTATIVAS, erro,
+            )
+            time.sleep(2 * tentativa)
+
+    log.error("Desisti de enviar esta mensagem no Discord apos %s tentativas.", MAX_TENTATIVAS)
+    return False
+
+
+def notificar(item: dict, config: dict) -> bool:
+    """
+    Manda o item para todos os canais configurados.
+
+    Se voce preencheu so o Telegram, vai so pro Telegram. Se preencheu so o
+    Discord, vai so pro Discord. Se preencheu os dois, vai pros dois.
+    """
+    enviou_algum = False
+
+    if config["telegram_token"] and config["telegram_chat_id"]:
+        if enviar_telegram(item, config["telegram_token"], config["telegram_chat_id"]):
+            enviou_algum = True
+
+    if config["discord_webhook"]:
+        if enviar_discord(item, config["discord_webhook"]):
+            enviou_algum = True
+
+    return enviou_algum
+
+
+# ==========================================================================
+#  7. CONFIGURACAO (.env)
+# ==========================================================================
+
+def carregar_config() -> dict:
+    """Le o arquivo .env e confere se pelo menos um canal foi configurado."""
+    load_dotenv()
+
+    config = {
+        "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
+        "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+        "discord_webhook": os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        # Vazio = monitora lancamentos de TODAS as abas do site.
+        # Preenchido = so daquela aba (ex: 11 para Shoes, 32 para Hoodie).
+        "categoria": os.getenv("CATEGORIA_ID", "").strip(),
+        # Traduzir os titulos para portugues? (sim por padrao)
+        "traduzir": os.getenv("TRADUZIR", "sim").strip().lower()
+                    not in ("nao", "não", "no", "0", "false"),
+        # E-mail opcional: aumenta a cota diaria gratuita de traducao
+        "traducao_email": os.getenv("TRADUCAO_EMAIL", "").strip(),
+        # Se preenchido, usa arquivo de texto no lugar do banco SQLite.
+        # E o modo usado quando o bot roda hospedado (GitHub Actions).
+        "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
+    }
+
+    tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
+    tem_discord = bool(config["discord_webhook"])
+
+    if not tem_telegram and not tem_discord:
+        log.error(
+            "Nenhum canal de notificacao configurado!\n"
+            "   Abra o arquivo .env e preencha OU o Telegram "
+            "(TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID) OU o Discord "
+            "(DISCORD_WEBHOOK_URL).\n"
+            "   O passo a passo esta no README.md."
+        )
+        sys.exit(1)
+
+    canais = []
+    if tem_telegram:
+        canais.append("Telegram")
+    if tem_discord:
+        canais.append("Discord")
+    log.info("Canais ativos: %s", " + ".join(canais))
+
+    if config["categoria"]:
+        nome = CATEGORIAS.get(config["categoria"], "categoria " + config["categoria"])
+        log.info("Monitorando SOMENTE a aba: %s", nome)
+    else:
+        log.info("Monitorando lancamentos de TODAS as abas do site.")
+
+    if config["traduzir"]:
+        log.info("Traducao dos titulos para portugues: LIGADA.")
+    else:
+        log.info("Traducao dos titulos: desligada (titulos no idioma original).")
+
+    return config
+
+
+# ==========================================================================
+#  8. RODADA DE COLETA
+# ==========================================================================
+
+def rodar_coleta(config: dict) -> None:
+    """Executa UMA rodada: pergunta os lancamentos, salva e avisa os novos."""
+    inicio = time.time()
+    log.info("=" * 60)
+    log.info("Procurando lancamentos novos em %s", SITE_BASE)
+
+    # Passo 0: pedir licenca ao robots.txt antes de qualquer acesso
+    if not robots_permite(API_PRODUTOS):
+        return
+
+    conexao = abrir_banco()
+    criar_cache_traducao(conexao)
+    sessao = criar_sessao()
+    primeira_vez = banco_vazio(conexao)
+
+    # Passo 1: buscar os produtos mais recentes na API do site
+    registros = buscar_lancamentos(sessao, config["categoria"])
+    if registros is None:
+        log.error("Rodada abortada: nao consegui falar com o site.")
+        conexao.close()
+        return
+
+    time.sleep(DELAY_ENTRE_REQUISICOES)   # educacao com o servidor
+
+    # Passo 2: converter para o formato do bot
+    itens = extrair_itens(registros)
+    log.info("Produtos lidos nesta rodada: %s (os mais recentes do site)", len(itens))
+
+    if not itens:
+        log.warning(
+            "Nenhum produto veio na resposta. Ou o site esta sem novidades, "
+            "ou a API mudou — me chame para ajustar."
+        )
+        conexao.close()
+        return
+
+    # Passo 3: PRIMEIRA RODADA — so registra a base, sem notificar.
+    # Sem isso voce receberia 50 mensagens de uma vez logo de cara, de
+    # produtos que ja estavam no site antes de voce ligar o bot.
+    if primeira_vez:
+        for item in itens:
+            salvar_item(conexao, item, ja_notificado=True)
+        conexao.close()
+        log.info(
+            "PRIMEIRA RODADA: guardei %s produtos como ponto de partida, "
+            "sem enviar mensagem.", len(itens),
+        )
+        log.info(
+            "A partir de agora voce so sera avisado do que for LANCADO "
+            "depois deste momento. Pode deixar o bot rodando."
+        )
+        return
+
+    # Passo 4: separar o que e realmente novo
+    novos = []
+    for item in itens:
+        if item_ja_existe(conexao, item["id"]):
+            continue
+        salvar_item(conexao, item)      # salva na hora (incremental)
+        novos.append(item)
+
+    log.info("LANCAMENTOS NOVOS nesta rodada: %s", len(novos))
+
+    # Passo 4.5: traduzir os titulos dos novos para portugues.
+    # So os NOVOS sao traduzidos — os 50 da primeira rodada nao gastam cota.
+    if novos and config["traduzir"]:
+        log.info("Traduzindo %s titulo(s) para portugues...", len(novos))
+        for item in novos:
+            item["titulo_pt"] = traduzir(
+                item["titulo"], conexao, config["traducao_email"]
+            )
+            conexao.execute(
+                "UPDATE itens SET titulo_pt = ? WHERE id = ?",
+                (item["titulo_pt"], item["id"]),
+            )
+        conexao.commit()
+
+    # Aviso util: se TODOS os produtos lidos forem novos, e sinal de que
+    # sairam mais lancamentos do que o bot consegue ver por rodada.
+    if novos and len(novos) == len(itens):
+        log.warning(
+            "Todos os %s produtos lidos eram novos — pode ter escapado algum. "
+            "Se isso repetir, aumente TAMANHO_PAGINA no bot.py ou rode com "
+            "intervalo menor.", len(itens),
+        )
+
+    # Passo 5: notificar tudo que ainda nao foi avisado.
+    # Inclui os novos de agora E qualquer atrasado de rodadas anteriores
+    # (por exemplo, se o Discord estava fora do ar ou o .env estava errado).
+    pendentes = buscar_pendentes(conexao)
+    atrasados = len(pendentes) - len(novos)
+    if atrasados > 0:
+        log.info("Tambem ha %s item(ns) atrasado(s) de rodadas anteriores.", atrasados)
+
+    erros = 0
+    if pendentes:
+        a_enviar = pendentes[:MAX_NOTIFICACOES_POR_RODADA]
+        if len(pendentes) > MAX_NOTIFICACOES_POR_RODADA:
+            log.warning(
+                "Trava de seguranca: %s itens a avisar, mandando so os %s "
+                "primeiros para nao virar spam. O resto ja esta salvo e sera "
+                "avisado na proxima rodada.",
+                len(pendentes), MAX_NOTIFICACOES_POR_RODADA,
+            )
+
+        for numero, item in enumerate(a_enviar, 1):
+            log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
+            if notificar(item, config):
+                marcar_notificado(conexao, item["id"])
+            else:
+                erros += 1
+            # pausa para nao estourar o limite do Telegram (~1 msg/segundo)
+            if numero < len(a_enviar):
+                time.sleep(DELAY_ENTRE_MENSAGENS)
+
+    conexao.close()
+
+    duracao = time.time() - inicio
+    log.info(
+        "Rodada concluida em %.1fs | lidos: %s | lancamentos novos: %s | "
+        "erros de envio: %s", duracao, len(itens), len(novos), erros,
+    )
+
+
+def executar_rodada(config: dict) -> None:
+    """Escolhe o modo certo: arquivo de texto (hospedado) ou banco (local)."""
+    if config["arquivo_estado"]:
+        rodar_coleta_arquivo(config)
+    else:
+        rodar_coleta(config)
+
+
+def rodar_coleta_arquivo(config: dict) -> None:
+    """
+    Rodada no modo hospedado (GitHub Actions).
+
+    Diferenca para o modo local: nao existe banco de dados. A memoria do
+    que ja foi avisado e um arquivo de texto com um id por linha, que o
+    proprio GitHub versiona entre uma rodada e outra.
+
+    Outra diferenca importante: o id so entra na memoria DEPOIS que a
+    mensagem foi enviada com sucesso. Se o envio falhar, o produto continua
+    'nao avisado' e entra de novo na proxima rodada — nada se perde.
+    """
+    inicio = time.time()
+    caminho = config["arquivo_estado"]
+    log.info("=" * 60)
+    log.info("Procurando lancamentos novos em %s", SITE_BASE)
+
+    if not robots_permite(API_PRODUTOS):
+        return
+
+    ja_vistos = carregar_estado(caminho)
+    conjunto = set(ja_vistos)
+    primeira_vez = not ja_vistos
+
+    registros = buscar_lancamentos(criar_sessao(), config["categoria"])
+    if registros is None:
+        log.error("Rodada abortada: nao consegui falar com o site.")
+        return
+
+    itens = extrair_itens(registros)
+    log.info("Produtos lidos nesta rodada: %s (os mais recentes do site)", len(itens))
+    if not itens:
+        log.warning("Nenhum produto veio na resposta.")
+        return
+
+    # Primeira vez: so registra a base, sem encher voce de mensagens
+    if primeira_vez:
+        salvar_estado(caminho, [i["id"] for i in itens])
+        log.info(
+            "PRIMEIRA RODADA: guardei %s produtos como ponto de partida, "
+            "sem enviar mensagem.", len(itens),
+        )
+        log.info("A partir de agora voce so sera avisado do que for LANCADO depois.")
+        return
+
+    # A API devolve do mais novo para o mais antigo; invertemos para avisar
+    # na ordem em que os produtos foram publicados.
+    novos = [i for i in itens if i["id"] not in conjunto][::-1]
+    log.info("LANCAMENTOS NOVOS nesta rodada: %s", len(novos))
+
+    if novos and len(novos) == len(itens):
+        log.warning(
+            "Todos os %s produtos lidos eram novos — pode ter escapado algum. "
+            "Se repetir, aumente TAMANHO_PAGINA ou diminua o intervalo.", len(itens),
+        )
+
+    if not novos:
+        log.info("Rodada concluida em %.1fs | nada novo.", time.time() - inicio)
+        return
+
+    a_enviar = novos[:MAX_NOTIFICACOES_POR_RODADA]
+    if len(novos) > MAX_NOTIFICACOES_POR_RODADA:
+        log.warning(
+            "Trava de seguranca: %s novos, avisando so os %s primeiros. "
+            "O resto entra na proxima rodada.",
+            len(novos), MAX_NOTIFICACOES_POR_RODADA,
+        )
+
+    # Traduz so os que serao enviados agora
+    if config["traduzir"]:
+        log.info("Traduzindo %s titulo(s) para portugues...", len(a_enviar))
+        for item in a_enviar:
+            item["titulo_pt"] = traduzir(item["titulo"], None, config["traducao_email"])
+
+    erros = 0
+    for numero, item in enumerate(a_enviar, 1):
+        log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
+        if notificar(item, config):
+            ja_vistos.append(item["id"])
+            salvar_estado(caminho, ja_vistos)   # grava a cada envio (incremental)
+        else:
+            erros += 1
+        if numero < len(a_enviar):
+            time.sleep(DELAY_ENTRE_MENSAGENS)
+
+    log.info(
+        "Rodada concluida em %.1fs | lidos: %s | novos: %s | erros de envio: %s",
+        time.time() - inicio, len(itens), len(novos), erros,
+    )
+
+
+def testar_notificacao(config: dict) -> bool:
+    """Manda uma mensagem de teste para conferir se a configuracao esta certa."""
+    log.info("Enviando mensagem de TESTE...")
+    item_teste = {
+        "id": "teste",
+        "titulo": "Teste do bot — se voce esta lendo isso, funcionou!",
+        "titulo_pt": "",
+        "imagem": "",
+        "link": "",
+        "preco": "",
+        "categoria": "",
+        "plataforma": "",
+        "origem": "",
+    }
+    if notificar(item_teste, config):
+        log.info("SUCESSO! Va conferir no seu grupo — a mensagem chegou.")
+        return True
+
+    log.error(
+        "Nao consegui enviar. Confira o arquivo .env e as mensagens de "
+        "erro acima. O README.md explica como pegar o token e o chat id."
+    )
+    return False
+
+
+# ==========================================================================
+#  8.5 ASSISTENTE DE CONFIGURACAO  (bot.py --configurar)
+# ==========================================================================
+#  Faz as perguntas no Terminal e escreve o .env sozinho, para voce nao
+#  precisar editar arquivo nenhum na mao.
+# ==========================================================================
+
+def _perguntar(rotulo: str) -> str:
+    """Pergunta algo no Terminal e devolve a resposta sem espacos sobrando."""
+    try:
+        return input(rotulo).strip()
+    except EOFError:
+        return ""
+
+
+def _gravar_env(valores: dict) -> None:
+    """Escreve o arquivo .env e deixa ele legivel so por voce."""
+    linhas = [
+        "# Gerado pelo assistente (python bot.py --configurar)",
+        "# NAO compartilhe este arquivo com ninguem.",
+        "",
+    ]
+    for chave, valor in valores.items():
+        linhas.append("{}={}".format(chave, valor))
+
+    with open(".env", "w", encoding="utf-8") as arquivo:
+        arquivo.write("\n".join(linhas) + "\n")
+
+    try:
+        os.chmod(".env", 0o600)   # so o seu usuario pode ler
+    except OSError:
+        pass
+
+
+def _descobrir_chat_id(token: str) -> Optional[str]:
+    """
+    Descobre sozinho o ID do grupo do Telegram.
+
+    Le as ultimas mensagens que o bot recebeu e pega o grupo de onde elas
+    vieram. Por isso e preciso mandar uma mensagem no grupo antes.
+    """
+    try:
+        resposta = requests.get(
+            "https://api.telegram.org/bot{}/getUpdates".format(token), timeout=TIMEOUT
+        )
+        corpo = resposta.json()
+    except Exception as erro:
+        print("   Nao consegui falar com o Telegram: {}".format(erro))
+        return None
+
+    if not corpo.get("ok"):
+        print("   O Telegram recusou o token: {}".format(corpo.get("description")))
+        return None
+
+    # Procura de tras para frente: o grupo mais recente primeiro
+    for atualizacao in reversed(corpo.get("result") or []):
+        for campo in ("message", "channel_post", "my_chat_member"):
+            chat = (atualizacao.get(campo) or {}).get("chat") or {}
+            if chat.get("type") in ("group", "supergroup", "channel"):
+                print("   Grupo encontrado: {}".format(chat.get("title") or chat.get("id")))
+                return str(chat.get("id"))
+    return None
+
+
+def _gh(*argumentos) -> tuple:
+    """Roda um comando do GitHub CLI e devolve (deu_certo, saida)."""
+    import subprocess
+    caminho = os.path.expanduser("~/.local/bin/gh")
+    if not os.path.exists(caminho):
+        caminho = "gh"
+    try:
+        r = subprocess.run(
+            [caminho] + list(argumentos),
+            capture_output=True, text=True, timeout=60,
+        )
+        return r.returncode == 0, (r.stdout + r.stderr).strip()
+    except FileNotFoundError:
+        return False, "GitHub CLI (gh) nao encontrado."
+    except Exception as erro:
+        return False, str(erro)
+
+
+def configurar_github() -> None:
+    """
+    Guarda o token do Telegram (ou o webhook do Discord) no cofre do GitHub.
+
+    Tudo acontece na SUA maquina: voce digita o token aqui, ele vai direto
+    para o cofre do GitHub e nao fica salvo em arquivo nenhum.
+    """
+    print()
+    print("=" * 64)
+    print("  GUARDAR AS SENHAS NO COFRE DO GITHUB")
+    print("=" * 64)
+
+    ok, saida = _gh("auth", "status")
+    if not ok:
+        print()
+        print("  Voce ainda nao autorizou o GitHub CLI.")
+        print("  Rode primeiro:  ~/.local/bin/gh auth login --web")
+        return
+
+    repo = _perguntar("\n  Qual o repositorio? (ex: seu-usuario/bot-cssdeals): ")
+    if "/" not in repo:
+        print("  Formato invalido. Precisa ser usuario/repositorio.")
+        return
+
+    print()
+    print("  Onde voce quer receber os avisos?")
+    print("    1 - Telegram")
+    print("    2 - Discord")
+    escolha = _perguntar("  Digite 1 ou 2: ")
+
+    # ------------------------------- TELEGRAM ------------------------------
+    if escolha == "1":
+        print()
+        print("  Passo 1: pegue o token com o @BotFather no Telegram")
+        print("           (mande /newbot e siga as perguntas)")
+        print()
+        token = _perguntar("  Cole o token aqui: ")
+        if ":" not in token or len(token) < 20:
+            print("  Isso nao parece um token do Telegram.")
+            return
+
+        print()
+        print("  Passo 2: antes de continuar, confirme que voce ja:")
+        print("     a) criou o grupo no Telegram")
+        print("     b) adicionou o SEU bot nesse grupo")
+        print("     c) mandou qualquer mensagem no grupo (ex: 'oi')")
+        print()
+        _perguntar("  Feito? Aperte Enter para eu procurar o grupo... ")
+
+        chat_id = _descobrir_chat_id(token)
+        if not chat_id:
+            print()
+            print("  Nao achei nenhum grupo.")
+            print("  O mais comum: faltou mandar uma mensagem no grupo DEPOIS")
+            print("  de adicionar o bot. Faca isso e rode este comando de novo.")
+            return
+
+        print()
+        print("  Enviando uma mensagem de teste antes de salvar...")
+        if not enviar_telegram(
+            {"titulo": "Teste do bot — funcionou!", "titulo_pt": "", "imagem": "",
+             "link": "", "preco": "", "categoria": "", "plataforma": ""},
+            token, chat_id,
+        ):
+            print()
+            print("  A mensagem de teste NAO chegou. Nao vou salvar nada.")
+            print("  Confira se o bot esta mesmo no grupo e tente de novo.")
+            return
+
+        print("  Mensagem de teste enviada! Confira o grupo.")
+        print()
+        print("  Salvando no cofre do GitHub...")
+        segredos = {"TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": chat_id}
+
+    # ------------------------------- DISCORD -------------------------------
+    elif escolha == "2":
+        print()
+        url = _perguntar("  Cole a URL do webhook do Discord: ")
+        if "discord.com/api/webhooks/" not in url and \
+           "discordapp.com/api/webhooks/" not in url:
+            print("  Isso nao parece a URL de um webhook do Discord.")
+            return
+
+        print()
+        print("  Enviando uma mensagem de teste antes de salvar...")
+        if not enviar_discord(
+            {"titulo": "Teste do bot — funcionou!", "titulo_pt": "", "imagem": "",
+             "link": "", "preco": "", "categoria": "", "plataforma": ""}, url,
+        ):
+            print()
+            print("  A mensagem de teste NAO chegou. Nao vou salvar nada.")
+            return
+
+        print("  Mensagem de teste enviada! Confira o canal.")
+        print()
+        print("  Salvando no cofre do GitHub...")
+        segredos = {"DISCORD_WEBHOOK_URL": url}
+
+    else:
+        print("  Opcao invalida.")
+        return
+
+    # --------------------------- gravar no cofre ---------------------------
+    for nome, valor in segredos.items():
+        ok, saida = _gh("secret", "set", nome, "--repo", repo, "--body", valor)
+        if ok:
+            print("     {} ....... guardado".format(nome))
+        else:
+            print("     {} ....... FALHOU: {}".format(nome, saida[:120]))
+            return
+
+    print()
+    print("=" * 64)
+    print("  TUDO PRONTO!")
+    print()
+    print("  O bot ja esta no ar. Ele roda sozinho na nuvem do GitHub;")
+    print("  seu computador pode ficar desligado.")
+    print()
+    print("  A primeira rodada guarda os produtos atuais sem avisar.")
+    print("  Da segunda em diante chegam so os lancamentos novos.")
+    print("=" * 64)
+
+
+def assistente_configuracao() -> None:
+    """Conversa com voce no Terminal e monta o .env do zero."""
+    print()
+    print("=" * 64)
+    print("  ASSISTENTE DE CONFIGURACAO")
+    print("=" * 64)
+
+    if os.path.exists(".env"):
+        if _perguntar("Ja existe um .env. Quer refazer? (s/n): ").lower() not in ("s", "sim"):
+            print("Nada foi alterado.")
+            return
+
+    print()
+    print("  Onde voce quer receber os avisos?")
+    print("    1 - Discord   (mais facil: 4 cliques, sem criar bot)")
+    print("    2 - Telegram")
+    escolha = _perguntar("  Digite 1 ou 2: ")
+
+    valores = {"TRADUZIR": "sim", "TRADUCAO_EMAIL": "", "CATEGORIA_ID": ""}
+
+    # ------------------------------- DISCORD -------------------------------
+    if escolha == "1":
+        print()
+        print("  Como pegar a URL (no app do Discord):")
+        print("    1. Passe o mouse no canal que vai receber os avisos")
+        print("    2. Clique na engrenagem (Editar Canal)")
+        print("    3. Menu da esquerda: Integracoes -> Webhooks -> Novo webhook")
+        print("    4. Clique em 'Copiar URL do Webhook'")
+        print()
+
+        url = _perguntar("  Cole a URL aqui e aperte Enter: ")
+        if not url.startswith("https://discord.com/api/webhooks/") and \
+           not url.startswith("https://discordapp.com/api/webhooks/"):
+            print()
+            print("  Isso nao parece a URL de um webhook do Discord.")
+            print("  Ela precisa comecar com https://discord.com/api/webhooks/")
+            return
+
+        valores["DISCORD_WEBHOOK_URL"] = url
+        valores["TELEGRAM_BOT_TOKEN"] = ""
+        valores["TELEGRAM_CHAT_ID"] = ""
+
+    # ------------------------------- TELEGRAM ------------------------------
+    elif escolha == "2":
+        print()
+        print("  Como pegar o token:")
+        print("    1. No Telegram, procure @BotFather (tem selo azul)")
+        print("    2. Mande /newbot e siga as perguntas")
+        print("    3. Ele responde com o token (algo como 123456:AAH...)")
+        print()
+
+        token = _perguntar("  Cole o token aqui e aperte Enter: ")
+        if ":" not in token or len(token) < 20:
+            print()
+            print("  Isso nao parece um token do Telegram.")
+            return
+
+        print()
+        print("  Agora preciso descobrir o ID do grupo. Antes de continuar:")
+        print("    1. Crie o grupo (se ainda nao criou)")
+        print("    2. Adicione o seu bot ao grupo")
+        print("    3. Mande QUALQUER mensagem no grupo (ex: 'oi')")
+        print()
+        _perguntar("  Feito isso, aperte Enter para eu procurar... ")
+
+        chat_id = _descobrir_chat_id(token)
+        if not chat_id:
+            print()
+            print("  Nao achei nenhum grupo.")
+            print("  Confirme que o bot foi adicionado E que voce mandou uma")
+            print("  mensagem no grupo depois disso. Depois rode de novo:")
+            print("      .venv/bin/python bot.py --configurar")
+            return
+
+        valores["TELEGRAM_BOT_TOKEN"] = token
+        valores["TELEGRAM_CHAT_ID"] = chat_id
+        valores["DISCORD_WEBHOOK_URL"] = ""
+
+    else:
+        print("  Opcao invalida. Rode de novo e digite 1 ou 2.")
+        return
+
+    # ------------------------- gravar e testar -----------------------------
+    _gravar_env(valores)
+    print()
+    print("  Arquivo .env gravado. Mandando uma mensagem de teste...")
+    print()
+
+    load_dotenv(override=True)
+    config = {
+        "telegram_token": valores.get("TELEGRAM_BOT_TOKEN", ""),
+        "telegram_chat_id": valores.get("TELEGRAM_CHAT_ID", ""),
+        "discord_webhook": valores.get("DISCORD_WEBHOOK_URL", ""),
+    }
+    deu_certo = testar_notificacao(config)
+
+    print()
+    print("=" * 64)
+    if deu_certo:
+        print("  TUDO PRONTO! A mensagem de teste chegou no seu grupo.")
+        print()
+        print("  O agendador ja esta ligado e roda a cada 15 minutos.")
+        print("  A primeira rodada guarda os produtos atuais sem avisar;")
+        print("  depois disso voce recebe so os lancamentos novos.")
+    else:
+        print("  A CONFIGURACAO FOI SALVA, MAS O TESTE NAO PASSOU.")
+        print()
+        print("  Veja a mensagem de erro logo acima — ela diz o motivo.")
+        print("  O mais comum e a URL/token ter sido copiado pela metade.")
+        print()
+        print("  Para tentar de novo:")
+        print("      .venv/bin/python bot.py --configurar")
+    print("=" * 64)
+
+
+# ==========================================================================
+#  9. PONTO DE ENTRADA
+# ==========================================================================
+
+def main() -> None:
+    leitor = argparse.ArgumentParser(
+        description="Bot de coleta com notificacao no Telegram/Discord."
+    )
+    leitor.add_argument(
+        "--loop", action="store_true",
+        help=f"Roda sem parar, a cada {INTERVALO_LOOP_MIN} minutos.",
+    )
+    leitor.add_argument(
+        "--configurar", action="store_true",
+        help="Assistente que pergunta os dados e monta o .env sozinho.",
+    )
+    leitor.add_argument(
+        "--configurar-github", dest="configurar_github", action="store_true",
+        help="Guarda o token/webhook no cofre do GitHub (para rodar hospedado).",
+    )
+    leitor.add_argument(
+        "--testar", action="store_true",
+        help="So envia uma mensagem de teste e sai (nao coleta nada).",
+    )
+    argumentos = leitor.parse_args()
+
+    # O assistente roda ANTES da checagem de configuracao — e justamente
+    # ele que cria o .env que a checagem exige.
+    if argumentos.configurar:
+        assistente_configuracao()
+        return
+
+    if argumentos.configurar_github:
+        configurar_github()
+        return
+
+    config = carregar_config()
+
+    if argumentos.testar:
+        if not testar_notificacao(config):
+            sys.exit(1)
+        return
+
+    if argumentos.loop:
+        log.info(
+            "MODO CONTINUO ligado — rodando a cada %s minutos. "
+            "Para parar, aperte Control + C.",
+            INTERVALO_LOOP_MIN,
+        )
+        while True:
+            try:
+                executar_rodada(config)
+            except Exception as erro:
+                # Blindagem final: nada derruba o loop
+                log.exception("Erro inesperado na rodada: %s", erro)
+
+            log.info("Proxima rodada em %s minutos...\n", INTERVALO_LOOP_MIN)
+            time.sleep(INTERVALO_LOOP_MIN * 60)
+    else:
+        executar_rodada(config)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log.info("\nBot encerrado por voce. Ate mais!")
+        sys.exit(0)

@@ -1,0 +1,11 @@
+# NUNCA versionar o arquivo com os tokens
+.env
+
+# Dados e logs gerados pelo bot
+dados.db
+*.log
+
+# Ambiente virtual do Python
+.venv/
+__pycache__/
+*.pyc

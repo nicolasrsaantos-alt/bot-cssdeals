@@ -1,0 +1,9 @@
+# Dependencias do bot de coleta
+# Instale com:  pip install -r requirements.txt
+
+requests==2.32.3          # faz as requisicoes HTTP (falar com o site)
+python-dotenv==1.0.1      # carrega o arquivo .env com os tokens
+
+# Versao 1.x do urllib3: evita um aviso chato de SSL no macOS.
+# Nao mude isso a menos que saiba o que esta fazendo.
+urllib3==1.26.20
