@@ -1199,6 +1199,120 @@ def _gh(*argumentos) -> tuple:
         return False, str(erro)
 
 
+def diagnosticar_telegram() -> None:
+    """
+    Investiga por que o grupo nao foi encontrado e diz exatamente o que fazer.
+
+    Verifica, em ordem: se o token e valido, se ha um webhook atrapalhando,
+    se o modo privacidade esta ligado e o que o bot realmente recebeu.
+    """
+    print()
+    print("=" * 64)
+    print("  DIAGNOSTICO DO TELEGRAM")
+    print("=" * 64)
+
+    token = _perguntar("\n  Cole o token do @BotFather: ")
+    if ":" not in token or len(token) < 20:
+        print("  Isso nao parece um token do Telegram.")
+        return
+
+    base = "https://api.telegram.org/bot{}".format(token)
+
+    def chamar(metodo):
+        try:
+            return requests.get("{}/{}".format(base, metodo), timeout=TIMEOUT).json()
+        except Exception as erro:
+            return {"ok": False, "description": str(erro)}
+
+    # ---- 1. o token funciona? ----
+    print()
+    print("  [1] Conferindo o token...")
+    eu = chamar("getMe")
+    if not eu.get("ok"):
+        print("      X TOKEN INVALIDO: {}".format(eu.get("description")))
+        print("      Copie o token de novo do @BotFather (inteiro, sem espacos).")
+        return
+
+    dados = eu["result"]
+    print("      OK - bot: @{} ({})".format(dados.get("username"), dados.get("first_name")))
+    print("      pode ser adicionado a grupos: {}".format(
+        "sim" if dados.get("can_join_groups") else "NAO"))
+    print("      le mensagens comuns de grupo: {}".format(
+        "sim" if dados.get("can_read_all_group_messages") else "NAO (modo privacidade LIGADO)"))
+
+    # ---- 2. tem webhook atrapalhando? ----
+    print()
+    print("  [2] Conferindo se ha webhook configurado...")
+    webhook = chamar("getWebhookInfo")
+    url_webhook = (webhook.get("result") or {}).get("url") or ""
+    if url_webhook:
+        print("      X TEM UM WEBHOOK ATIVO: {}".format(url_webhook[:60]))
+        print("      Enquanto ele existir, o bot NAO consegue ler as mensagens.")
+        print("      Remova abrindo este endereco no navegador:")
+        print("      {}/deleteWebhook".format(base))
+        return
+    print("      OK - nenhum webhook atrapalhando")
+
+    # ---- 3. o que o bot recebeu? ----
+    print()
+    print("  [3] Vendo o que o bot recebeu...")
+    atualizacoes = chamar("getUpdates")
+    if not atualizacoes.get("ok"):
+        print("      X {}".format(atualizacoes.get("description")))
+        return
+
+    lista = atualizacoes.get("result") or []
+    print("      {} evento(s) recebido(s)".format(len(lista)))
+
+    grupos = {}
+    for item in lista:
+        for campo, conteudo in item.items():
+            if not isinstance(conteudo, dict):
+                continue
+            chat = conteudo.get("chat") or {}
+            if chat.get("id"):
+                print("        - {}: chat '{}' (tipo {})".format(
+                    campo, chat.get("title") or chat.get("first_name"), chat.get("type")))
+                if chat.get("type") in ("group", "supergroup", "channel"):
+                    grupos[str(chat["id"])] = chat.get("title")
+
+    # ---- veredito ----
+    print()
+    print("=" * 64)
+    if grupos:
+        print("  GRUPO ENCONTRADO!")
+        for ident, titulo in grupos.items():
+            print("     {}  ->  {}".format(titulo, ident))
+        print()
+        print("  Agora rode de novo:")
+        print("     .venv/bin/python bot.py --configurar-github")
+    else:
+        print("  NENHUM GRUPO ENCONTRADO. O que fazer:")
+        print()
+        if not dados.get("can_read_all_group_messages"):
+            print("  CAUSA MAIS PROVAVEL: modo privacidade ligado.")
+            print("  Bots do @BotFather nascem sem poder ler mensagens comuns")
+            print("  de grupo — so mensagens que comecam com barra ( / ).")
+            print()
+            print("  SOLUCAO RAPIDA (10 segundos):")
+            print("     Mande  /start  no grupo. Mensagens com barra sempre")
+            print("     chegam ao bot, mesmo com o modo privacidade ligado.")
+            print()
+            print("  SOLUCAO DEFINITIVA (se preferir):")
+            print("     No @BotFather mande /setprivacy, escolha @{}".format(
+                dados.get("username")))
+            print("     e clique em Disable. Depois REMOVA e ADICIONE o bot")
+            print("     no grupo de novo (a mudanca so vale ao reentrar).")
+        else:
+            print("  O modo privacidade ja esta desligado, entao confira:")
+            print("     - o bot @{} esta MESMO nesse grupo?".format(dados.get("username")))
+            print("     - voce mandou a mensagem DEPOIS de adicionar ele?")
+            print("     - o token e desse bot mesmo (nao de outro que voce criou)?")
+        print()
+        print("  Depois disso, rode este diagnostico de novo.")
+    print("=" * 64)
+
+
 def configurar_github() -> None:
     """
     Guarda o token do Telegram (ou o webhook do Discord) no cofre do GitHub.
@@ -1458,6 +1572,10 @@ def main() -> None:
         help="Guarda o token/webhook no cofre do GitHub (para rodar hospedado).",
     )
     leitor.add_argument(
+        "--diagnosticar-telegram", dest="diag_telegram", action="store_true",
+        help="Descobre por que o grupo do Telegram nao foi encontrado.",
+    )
+    leitor.add_argument(
         "--testar", action="store_true",
         help="So envia uma mensagem de teste e sai (nao coleta nada).",
     )
@@ -1471,6 +1589,10 @@ def main() -> None:
 
     if argumentos.configurar_github:
         configurar_github()
+        return
+
+    if argumentos.diag_telegram:
+        diagnosticar_telegram()
         return
 
     config = carregar_config()
