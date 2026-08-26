@@ -15,14 +15,21 @@ on:
   # Permite rodar na mao pelo site do GitHub, sem esperar o agendamento
   workflow_dispatch:
 
-# Impede duas rodadas ao mesmo tempo (evitaria mensagem duplicada)
+# Impede duas rodadas ao mesmo tempo (evitaria mensagem duplicada).
+# O nome tem sufixo porque uma rodada travou numa queda do GitHub em
+# 26/08/2026 e ficou presa na fila para sempre, bloqueando as demais.
+# Trocar o nome do grupo e a unica forma de escapar de uma rodada zumbi.
 concurrency:
-  group: monitor-cssdeals
+  group: monitor-cssdeals-v2
   cancel-in-progress: false
 
 jobs:
   monitorar:
     runs-on: ubuntu-latest
+
+    # Se uma rodada travar, ela morre em 10 minutos em vez de ficar
+    # presa e bloquear todas as proximas.
+    timeout-minutes: 10
 
     # Necessario para o bot salvar a memoria (vistos.txt) de volta
     permissions:
