@@ -62,7 +62,20 @@ API_PRODUTOS = SITE_BASE + "/api/product"
 # Quantos produtos ler por rodada (do mais novo para o mais antigo).
 # 50 da uma margem folgada: mesmo que o site cadastre varios produtos
 # em 15 minutos, nenhum passa despercebido.
-TAMANHO_PAGINA = 50
+TAMANHO_PAGINA = 100          # maximo aceito pela API (acima disso ela devolve 20!)
+
+# --- Varredura profunda ---
+#  A API ordena por ID, que e a ordem de CRIACAO do produto — nao a de
+#  publicacao. O cssdeals as vezes torna visivel um produto criado ha
+#  dias: ele carrega o ID antigo e nasce no MEIO da lista, nunca no topo.
+#
+#  Ler so o topo deixaria esses produtos invisiveis para sempre, porque
+#  eles nunca sobem. Por isso, de tempos em tempos o bot varre uma janela
+#  bem mais funda procurando qualquer ID que ainda nao conheca,
+#  independentemente da posicao.
+PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
+MINUTOS_ENTRE_VARREDURAS = 20
+DELAY_ENTRE_PAGINAS = 1.5
 
 # Pagina do link de compra de cada produto
 URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
@@ -320,57 +333,69 @@ def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
     return None
 
 
-def buscar_lancamentos(sessao: requests.Session, categoria: str = "") -> Optional[list]:
+def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
+                       paginas: int = 1) -> Optional[list]:
     """
-    Pergunta a API do site quais sao os produtos MAIS NOVOS.
+    Pergunta a API do site quais produtos existem, do mais recente para o
+    mais antigo.
 
-    A API ja devolve ordenado do mais recente para o mais antigo, entao a
-    primeira pagina e exatamente a lista de lancamentos.
-
-    Se `categoria` estiver vazio, traz lancamentos de TODAS as abas do site
-    (Shoes, Hoodie, Pants, etc) de uma vez so.
+    `paginas=1` e a leitura rapida de rotina (so o topo).
+    `paginas=10` e a varredura profunda, que procura produtos que ficaram
+    visiveis agora mas foram criados ha dias — esses nascem no meio da
+    lista e o topo nunca os mostra.
     """
-    parametros = {
-        "fields": 1,
-        "categoryId": categoria,
-        "page": 1,
-        "pageSize": TAMANHO_PAGINA,
-        "priceMin": "0.00",
-        "priceMax": "99999.00",
-    }
+    todos = []
 
-    try:
-        resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
-        resposta.raise_for_status()
-        corpo = resposta.json()
-    except requests.exceptions.Timeout:
-        log.error("Timeout: o site demorou mais de %ss para responder.", TIMEOUT)
-        return None
-    except requests.exceptions.ConnectionError:
-        log.error("Conexao recusada ou sem internet.")
-        return None
-    except requests.exceptions.HTTPError as erro:
-        log.error("O site respondeu com erro: %s", erro)
-        return None
-    except ValueError:
-        log.error("O site respondeu algo que nao e JSON (o layout pode ter mudado).")
-        return None
-    except Exception as erro:
-        log.error("Erro inesperado ao consultar a API: %s", erro)
-        return None
+    for numero in range(1, paginas + 1):
+        parametros = {
+            "fields": 1,
+            "categoryId": categoria,
+            "page": numero,
+            "pageSize": TAMANHO_PAGINA,
+            "priceMin": "0.00",
+            "priceMax": "99999.00",
+        }
 
-    # A API sempre responde HTTP 200; o erro de verdade vem no campo "code"
-    if corpo.get("code") != 0:
-        log.error("A API recusou a consulta: %s", corpo.get("msg") or corpo.get("code"))
-        return None
+        try:
+            resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
+            resposta.raise_for_status()
+            corpo = resposta.json()
+        except requests.exceptions.Timeout:
+            log.error("Timeout: o site demorou mais de %ss para responder.", TIMEOUT)
+            return todos or None
+        except requests.exceptions.ConnectionError:
+            log.error("Conexao recusada ou sem internet.")
+            return todos or None
+        except requests.exceptions.HTTPError as erro:
+            log.error("O site respondeu com erro: %s", erro)
+            return todos or None
+        except ValueError:
+            log.error("O site respondeu algo que nao e JSON (a API pode ter mudado).")
+            return todos or None
+        except Exception as erro:
+            log.error("Erro inesperado ao consultar a API: %s", erro)
+            return todos or None
 
-    dados = corpo.get("data") or {}
-    registros = dados.get("records") or []
-    total = dados.get("total")
-    if total is not None:
-        log.info("Catalogo do site tem %s produtos no total.", total)
+        if corpo.get("code") != 0:
+            log.error("A API recusou a consulta: %s", corpo.get("msg") or corpo.get("code"))
+            return todos or None
 
-    return registros
+        dados = corpo.get("data") or {}
+        registros = dados.get("records") or []
+
+        if numero == 1 and dados.get("total") is not None:
+            log.info("Catalogo do site tem %s produtos no total.", dados["total"])
+
+        todos.extend(registros)
+
+        # Pagina veio incompleta = chegamos ao fim do catalogo
+        if len(registros) < TAMANHO_PAGINA:
+            break
+
+        if numero < paginas:
+            time.sleep(DELAY_ENTRE_PAGINAS)   # educacao com o servidor
+
+    return todos
 
 
 def montar_item(registro: dict) -> Optional[dict]:
@@ -433,9 +458,9 @@ def extrair_itens(registros: list) -> list:
 #  consegue abrir e ler se quiser.
 # ==========================================================================
 
-# Quantos ids guardar. A janela de leitura do site e de ~6 horas, entao
-# 1000 e MUITO mais do que o necessario para nunca repetir um aviso.
-MAX_IDS_ESTADO = 1000
+# Quantos ids guardar. Precisa ser bem maior que a janela profunda
+# (1000 produtos), senao ids esquecidos voltariam a parecer novos.
+MAX_IDS_ESTADO = 4000
 
 
 def carregar_estado(caminho: str) -> list:
@@ -1013,7 +1038,15 @@ def rodar_coleta(config: dict) -> None:
     primeira_vez = banco_vazio(conexao)
 
     # Passo 1: buscar os produtos mais recentes na API do site
-    registros = buscar_lancamentos(sessao, config["categoria"])
+    paginas, profunda = paginas_desta_rodada(primeira_vez)
+    if profunda:
+        log.info(
+            "Varredura PROFUNDA: lendo %s paginas (~%s produtos) para achar "
+            "itens que ficaram visiveis agora mas foram criados ha dias.",
+            paginas, paginas * TAMANHO_PAGINA,
+        )
+
+    registros = buscar_lancamentos(sessao, config["categoria"], paginas)
     if registros is None:
         log.error("Rodada abortada: nao consegui falar com o site.")
         conexao.close()
@@ -1023,7 +1056,7 @@ def rodar_coleta(config: dict) -> None:
 
     # Passo 2: converter para o formato do bot
     itens = extrair_itens(registros)
-    log.info("Produtos lidos nesta rodada: %s (os mais recentes do site)", len(itens))
+    log.info("Produtos lidos nesta rodada: %s", len(itens))
 
     if not itens:
         log.warning(
@@ -1076,11 +1109,10 @@ def rodar_coleta(config: dict) -> None:
 
     # Aviso util: se TODOS os produtos lidos forem novos, e sinal de que
     # sairam mais lancamentos do que o bot consegue ver por rodada.
-    if novos and len(novos) == len(itens):
+    if novos and len(novos) == len(itens) and not profunda:
         log.warning(
             "Todos os %s produtos lidos eram novos — pode ter escapado algum. "
-            "Se isso repetir, aumente TAMANHO_PAGINA no bot.py ou rode com "
-            "intervalo menor.", len(itens),
+            "Se isso repetir, diminua o INTERVALO_SEGUNDOS.", len(itens),
         )
 
     # Passo 5: notificar tudo que ainda nao foi avisado.
@@ -1121,6 +1153,32 @@ def rodar_coleta(config: dict) -> None:
     )
 
 
+# Momento da ultima varredura profunda (0 = nunca fez)
+_ultima_varredura = 0.0
+
+
+def paginas_desta_rodada(primeira_vez: bool) -> tuple:
+    """
+    Decide se esta rodada le so o topo ou faz a varredura profunda.
+
+    Devolve (quantas_paginas, e_varredura_profunda).
+
+    Na primeira vez SEMPRE varre fundo: e preciso semear a janela inteira,
+    senao a primeira varredura acusaria centenas de produtos "novos" que
+    na verdade ja existiam.
+    """
+    global _ultima_varredura
+
+    agora = time.time()
+    passou = (agora - _ultima_varredura) >= MINUTOS_ENTRE_VARREDURAS * 60
+
+    if primeira_vez or passou:
+        _ultima_varredura = agora
+        return PAGINAS_PROFUNDAS, True
+
+    return 1, False
+
+
 def executar_rodada(config: dict) -> None:
     """Escolhe o modo certo: arquivo de texto (hospedado) ou banco (local)."""
     if config["arquivo_estado"]:
@@ -1153,13 +1211,18 @@ def rodar_coleta_arquivo(config: dict) -> None:
     conjunto = set(ja_vistos)
     primeira_vez = not ja_vistos
 
-    registros = buscar_lancamentos(criar_sessao(), config["categoria"])
+    paginas, profunda = paginas_desta_rodada(primeira_vez)
+    if profunda:
+        log.info("Varredura PROFUNDA: lendo %s paginas (~%s produtos).",
+                 paginas, paginas * TAMANHO_PAGINA)
+
+    registros = buscar_lancamentos(criar_sessao(), config["categoria"], paginas)
     if registros is None:
         log.error("Rodada abortada: nao consegui falar com o site.")
         return
 
     itens = extrair_itens(registros)
-    log.info("Produtos lidos nesta rodada: %s (os mais recentes do site)", len(itens))
+    log.info("Produtos lidos nesta rodada: %s", len(itens))
     if not itens:
         log.warning("Nenhum produto veio na resposta.")
         return

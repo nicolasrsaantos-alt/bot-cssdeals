@@ -10,32 +10,41 @@ Escrito para quem não é programador. É só seguir os passos na ordem.
 
 ---
 
-## ✅ Como o bot monitora os lançamentos (leia, é rápido)
+## ✅ Como o bot encontra os lançamentos
 
-Você comentou que o site tem várias abas (**Shoes**, **Hoodie**, **Pants**...),
-cada uma com subabas de tamanho, 20 produtos por página e às vezes mais de 20
-páginas. Varrer tudo isso daria **centenas de requisições** a cada rodada — e
-ainda correria o risco de perder algum lançamento.
+O site tem dezenas de abas (Shoes, Hoodie, Pants...) com subabas de tamanho e
+dezenas de páginas cada. Varrer tudo daria centenas de requisições por rodada.
 
-**Não é preciso.** Investigando o site, descobri que ele tem uma API interna
-que devolve os produtos **já ordenados do mais novo para o mais antigo**,
-misturando todas as abas e tamanhos.
+Não é preciso: a API interna devolve os produtos **ordenados por ID**, e ID é
+a ordem em que o produto foi **criado**.
 
-Como você só quer **lançamentos**, basta ler a primeira página dessa lista: o
-que apareceu de novo desde a última vez está sempre no topo.
+### O detalhe que quase passou batido
 
-| | Varrer aba por aba | O que o bot faz |
-|---|---|---|
-| Requisições por rodada | centenas | **1** |
-| Cobre todas as abas | só as configuradas | **todas, sempre** |
-| Peso no site | alto | mínimo |
+Ordem de criação **não é** ordem de publicação. O cssdeals às vezes torna
+visível um produto que foi criado dias atrás — ele carrega o ID antigo e
+aparece **no meio da lista**, nunca no topo. É por isso que um tênis publicado
+hoje pode cair na página 3 da aba Shoes.
 
-O bot lê os **50 produtos mais recentes** a cada rodada. O site cadastra
-bem menos que isso nesse intervalo, então sobra folga. Se algum dia todos os
-50 forem novos, o bot te avisa no log que talvez tenha escapado algum.
+Ler só o topo deixaria esses produtos **invisíveis para sempre**, porque eles
+nunca sobem.
 
-**Confirmado no site:** catálogo com **~10.000 produtos**, com itens sendo
-cadastrados **hoje**. Os produtos vêm de Taobao, Weidian e 1688.
+### A solução: duas velocidades
+
+| Tipo de rodada | Frequência | Lê | Serve para |
+|---|---|---|---|
+| **Rasa** | a cada 60s | 100 produtos | pegar os recém-criados, rápido |
+| **Profunda** | a cada 20 min | 1.000 produtos (~3 dias) | achar os que ficaram visíveis agora |
+
+A varredura profunda procura **qualquer ID que o bot ainda não conheça**,
+independentemente da posição na lista.
+
+Comprovado em teste: um produto na posição 500 **não é** detectado pela rodada
+rasa e **é** detectado pela profunda.
+
+### Uma armadilha da API
+
+Pedir `pageSize=200` devolve **20** produtos, não 200. Acima de 100 a API
+ignora o pedido e volta ao mínimo, sem erro nenhum. O máximo real é **100**.
 
 ### O que chega no seu grupo
 
