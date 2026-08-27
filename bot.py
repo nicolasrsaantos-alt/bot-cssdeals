@@ -1408,12 +1408,43 @@ def diagnosticar_telegram() -> None:
     print()
     print("=" * 64)
     if grupos:
-        print("  GRUPO ENCONTRADO!")
+        print("  ENCONTRADO!")
         for ident, titulo in grupos.items():
             print("     {}  ->  {}".format(titulo, ident))
+
+        # ---- teste de envio de verdade ----
         print()
-        print("  Agora rode de novo:")
-        print("     .venv/bin/python bot.py --configurar-github")
+        print("  [4] Mandando uma mensagem de TESTE agora...")
+        print()
+        algum_ok = False
+        for ident, titulo in grupos.items():
+            ok = enviar_telegram(
+                {"titulo": "Teste do bot — se voce esta lendo isso, "
+                           "o envio funciona!",
+                 "titulo_pt": "", "imagem": "", "link": "", "preco": "",
+                 "categoria": "", "plataforma": ""},
+                token, ident,
+            )
+            if ok:
+                algum_ok = True
+                print("      ENVIADO para '{}' — va conferir!".format(titulo))
+            else:
+                print("      FALHOU em '{}' (veja o erro acima).".format(titulo))
+                print("      Causa mais comum: o grupo/canal so deixa")
+                print("      administradores escreverem e o bot nao e admin.")
+
+        print()
+        print("=" * 64)
+        if algum_ok:
+            print("  A MENSAGEM CHEGOU? Entao token, ID e permissao estao OK.")
+            print()
+            print("  Use estes valores no Railway (aba Variables):")
+            for ident in grupos:
+                print("     TELEGRAM_CHAT_ID = {}".format(ident))
+        else:
+            print("  NAO CONSEGUI ENVIAR. O bot nao vai funcionar assim,")
+            print("  nem no Railway. Corrija a permissao e rode de novo.")
+        return
     else:
         print("  NENHUM GRUPO ENCONTRADO. O que fazer:")
         print()
