@@ -1,0 +1,17 @@
+# Workflow de DIAGNOSTICO — o mais simples possivel.
+# Serve so para descobrir se o agendamento do GitHub funciona nesta conta.
+# Sem segredos, sem concorrencia, sem permissoes, sem dependencias.
+# Pode apagar depois que o diagnostico terminar.
+
+name: Teste Agendamento
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  teste:
+    runs-on: ubuntu-latest
+    steps:
+      - run: date -u "+Rodou em %Y-%m-%d %H:%M UTC"
