@@ -89,10 +89,15 @@ CATEGORIAS = {
 # ==========================================================================
 #  2. CONFIGURACOES GERAIS
 # ==========================================================================
+# (algumas podem ser ajustadas por variavel de ambiente, sem mexer no codigo)
 
 BANCO_DADOS = "dados.db"          # arquivo SQLite onde tudo fica salvo
 ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
-INTERVALO_LOOP_MIN = 15           # minutos entre cada rodada no modo --loop
+# Segundos entre cada rodada no modo --loop (servidor sempre ligado).
+# 60s da o menor atraso possivel sem pesar no site: e 1 consulta por
+# minuto, enquanto o site publica ~2 produtos a cada 15 minutos.
+# O valor real e lido do .env em carregar_config() — este e so o padrao.
+INTERVALO_PADRAO = 60
 DELAY_ENTRE_REQUISICOES = 1.5     # segundos de pausa entre paginas do site
 DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
 TIMEOUT = 30                      # segundos ate desistir de uma requisicao
@@ -810,6 +815,22 @@ def notificar(item: dict, config: dict) -> bool:
 #  7. CONFIGURACAO (.env)
 # ==========================================================================
 
+def _inteiro_do_ambiente(nome: str, padrao: int) -> int:
+    """Le um numero do .env; se estiver vazio ou escrito errado, usa o padrao."""
+    bruto = os.getenv(nome, "").strip()
+    if not bruto:
+        return padrao
+    try:
+        valor = int(bruto)
+    except ValueError:
+        log.warning("%s='%s' nao e um numero. Usando %s.", nome, bruto, padrao)
+        return padrao
+    if valor < 10:
+        log.warning("%s=%s e agressivo demais com o site. Usando 10.", nome, valor)
+        return 10
+    return valor
+
+
 def carregar_config() -> dict:
     """Le o arquivo .env e confere se pelo menos um canal foi configurado."""
     load_dotenv()
@@ -829,6 +850,7 @@ def carregar_config() -> dict:
         # Se preenchido, usa arquivo de texto no lugar do banco SQLite.
         # E o modo usado quando o bot roda hospedado (GitHub Actions).
         "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
+        "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1561,7 +1583,7 @@ def main() -> None:
     )
     leitor.add_argument(
         "--loop", action="store_true",
-        help=f"Roda sem parar, a cada {INTERVALO_LOOP_MIN} minutos.",
+        help="Roda sem parar (intervalo pelo INTERVALO_SEGUNDOS do .env).",
     )
     leitor.add_argument(
         "--configurar", action="store_true",
@@ -1604,9 +1626,8 @@ def main() -> None:
 
     if argumentos.loop:
         log.info(
-            "MODO CONTINUO ligado — rodando a cada %s minutos. "
-            "Para parar, aperte Control + C.",
-            INTERVALO_LOOP_MIN,
+            "MODO CONTINUO ligado — verificando a cada %s segundos.",
+            config["intervalo"],
         )
         while True:
             try:
@@ -1615,8 +1636,7 @@ def main() -> None:
                 # Blindagem final: nada derruba o loop
                 log.exception("Erro inesperado na rodada: %s", erro)
 
-            log.info("Proxima rodada em %s minutos...\n", INTERVALO_LOOP_MIN)
-            time.sleep(INTERVALO_LOOP_MIN * 60)
+            time.sleep(config["intervalo"])
     else:
         executar_rodada(config)
 

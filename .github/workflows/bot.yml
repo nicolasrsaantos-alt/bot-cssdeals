@@ -3,20 +3,19 @@
 
 name: Monitor CSSDeals
 
-on:
-  schedule:
-    # A cada 15 minutos.
-    #
-    # POR QUE NAO 5 MINUTOS: o GitHub trata agendamentos muito frequentes
-    # como baixa prioridade e simplesmente os descarta sob carga. Com
-    # '*/5' este bot passou 20 horas sem disparar NENHUMA vez. Intervalos
-    # maiores sao bem mais confiaveis — 15 minutos que acontecem valem
-    # mais que 5 minutos que nunca acontecem.
-    #
-    # Nao ha perda de produtos: o bot le os 50 mais recentes, o que cobre
-    # ~6 horas de publicacoes do site.
-    - cron: '*/15 * * * *'
+# AGENDAMENTO DESLIGADO.
+#
+# O bot passou a rodar no Railway, em loop continuo, com memoria propria.
+# Se o GitHub tambem rodasse por conta, seriam dois bots com memorias
+# separadas — e voce receberia cada produto DUAS vezes.
+#
+# O disparo manual continua disponivel como reserva: aba Actions ->
+# Monitor CSSDeals -> Run workflow.
+#
+# (E o agendamento nunca chegou a funcionar nesta conta: 0 disparos em
+#  mais de 24h, mesmo com um workflow minimo de teste.)
 
+on:
   # Permite rodar na mao pelo site do GitHub, sem esperar o agendamento
   workflow_dispatch:
 

@@ -109,127 +109,79 @@ por trás — e ela tem **~10.000 produtos de verdade, atualizados diariamente**
 
 ## Onde o bot roda
 
-**Na nuvem do GitHub — não no seu Mac.** Seu MacBook pode ficar desligado.
+**No Railway** — um servidor na nuvem, sempre ligado. Seu computador pode
+ficar desligado.
 
-O agendador local foi desativado de propósito: se os dois rodassem juntos,
-eles teriam memórias separadas e você receberia **cada produto duas vezes**.
+O bot fica em **loop contínuo**: consulta o site a cada **60 segundos** e
+avisa na hora. Não depende de agendador de terceiros.
 
----
+### Por que saímos do GitHub Actions
 
-## Como colocar no ar (uma vez só, ~10 minutos)
+Ficou 24 horas sem disparar **nenhuma** rodada agendada. Testamos tudo:
+e-mail verificado, workflow `active`, branch correta, cron válido, Actions
+habilitado. Até subimos um workflow de 10 linhas que só imprime a data —
+e nem ele rodou.
 
-### 1. Criar conta no GitHub (se ainda não tem)
+Rodadas manuais sempre funcionaram, o que provou que o bot estava certo.
+O problema era o agendamento do GitHub nessa conta (provavelmente restrição
+de conta recém-criada, que eles não documentam).
 
-Acesse **github.com** → *Sign up*. É gratuito e não pede cartão.
-
-### 2. Criar o repositório
-
-Em **github.com/new**:
-
-- **Repository name:** `bot-cssdeals`
-- **Visibilidade:** marque **Public** ⚠️
-
-> **Por que Public?** O GitHub dá minutos de execução **ilimitados** para
-> repositórios públicos, e só 2.000 min/mês nos privados. Rodando a cada 5
-> minutos, o limite privado estouraria em poucos dias.
->
-> **Não tem risco:** o webhook não fica no código — ele vai pro cofre de
-> senhas do GitHub (próximo passo). O que fica público é só o programa e a
-> lista de números de produtos já avisados.
-
-- **Não marque** nenhuma opção de "Add README/.gitignore/license"
-- Clique em **Create repository**
-
-### 3. Enviar o código
-
-Na página que aparece, copie seu endereço (algo como
-`https://github.com/SEU-USUARIO/bot-cssdeals.git`) e cole no Terminal,
-trocando pelo seu:
-
-```bash
-cd /Users/nicolas/bot-coleta && git remote add origin https://github.com/SEU-USUARIO/bot-cssdeals.git && git push -u origin main
-```
-
-O GitHub vai pedir login. Se pedir senha, ele quer um **token**, não sua
-senha — ele mesmo mostra o link para gerar.
-
-### 4. Guardar as senhas no cofre
-
-Não precisa mexer no site do GitHub. Um comando faz tudo:
-
-```bash
-cd /Users/nicolas/bot-coleta && .venv/bin/python bot.py --configurar-github
-```
-
-Ele pergunta o repositório, se você quer Telegram ou Discord, e guarda as
-senhas direto no cofre do GitHub.
-
-#### Se escolher Telegram
-
-Prepare estas duas coisas antes:
-
-**a) O token do bot**
-
-1. No Telegram, procure **@BotFather** (tem selo azul de verificado)
-2. Mande `/newbot`
-3. Ele pergunta o **nome** — pode ser qualquer um, ex: `Avisos CSSDeals`
-4. Ele pergunta o **username** — precisa terminar em `bot`, ex: `avisoscss_bot`
-5. Ele responde com o token, algo como `7891234567:AAHk9x-abcdefGHIJKL`
-
-**b) O grupo com o bot dentro**
-
-1. Crie um grupo no Telegram
-2. Nome do grupo no topo → **Adicionar Membros** → procure o username do seu
-   bot → adicione
-3. **Mande qualquer mensagem no grupo** (ex: "oi") — isso é obrigatório
-
-Pronto. O assistente **descobre o ID do grupo sozinho** — era a parte mais
-confusa do processo e você não precisa fazer nada.
-
-#### Se escolher Discord
-
-Canal → engrenagem (Editar Canal) → **Integrações** → **Webhooks** →
-**Novo webhook** → **Copiar URL do Webhook**. Cole quando ele pedir.
-
-#### Como ele se comporta
-
-O assistente **manda uma mensagem de teste antes de salvar**. Se ela não
-chegar, ele **não guarda nada** e te diz o motivo — assim você nunca fica com
-uma configuração quebrada achando que está tudo certo.
-
-> As senhas vão do seu Terminal direto para o cofre do GitHub. Não ficam
-> salvas em arquivo nenhum na sua máquina.
-
-### 5. Ligar
-
-Aba **Actions** do repositório → se pedir, clique em
-**I understand my workflows, go ahead and enable them** → escolha
-**Monitor CSSDeals** na esquerda → **Run workflow** → **Run workflow**.
-
-A primeira rodada **não envia mensagem** (guarda os 50 produtos atuais como
-ponto de partida). Da segunda em diante chegam só os lançamentos novos.
+O agendamento do GitHub ficou **desligado** para não enviar mensagem
+duplicada. O disparo manual continua disponível como reserva:
+*Actions → Monitor CSSDeals → Run workflow*.
 
 ---
 
-## Acompanhando
+## Como colocar no Railway (uma vez só, ~5 minutos)
 
-- **Ver as rodadas:** aba **Actions** do repositório. Bolinha verde = rodou bem.
-- **Ver o que ele já avisou:** arquivo `vistos.txt` no repositório.
-- **Forçar uma rodada agora:** Actions → Monitor CSSDeals → **Run workflow**.
-- **Pausar:** Actions → Monitor CSSDeals → botão `...` → **Disable workflow**.
+### 1. Criar a conta
 
-### Sobre o atraso
+Acesse **railway.com** → **Login with GitHub**. Como o código já está no seu
+GitHub, isso liga as duas contas automaticamente.
 
-O GitHub agenda para cada 5 minutos, mas **na prática atrasa** — em horário
-de pico pode levar de 5 a 40 minutos. É limitação da plataforma gratuita,
-não do bot.
+### 2. Criar o projeto
 
-**Nenhum produto é perdido por causa disso.** O bot lê os 50 mais recentes,
-o que cobre cerca de 6 horas de publicações do site. Mesmo um atraso de uma
-hora não deixa nada escapar — o aviso só chega mais tarde.
+**New Project** → **Deploy from GitHub repo** → escolha **bot-cssdeals**
 
-Se um dia o atraso incomodar, a solução é um servidor pequeno sempre ligado
-(~R$ 30/mês), onde o delay cai para menos de 1 minuto. É só pedir.
+Se ele pedir permissão para acessar seus repositórios, autorize.
+
+### 3. Configurar as senhas
+
+No projeto, abra a aba **Variables** e adicione uma por uma
+(**New Variable** → nome e valor):
+
+| Nome | Valor |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | o token do @BotFather |
+| `TELEGRAM_CHAT_ID` | o ID do grupo (começa com `-`) |
+| `TRADUZIR` | `sim` |
+| `INTERVALO_SEGUNDOS` | `60` |
+
+> **Não lembra o token ou o ID?** Eles estão guardados no cofre do GitHub,
+> mas de lá não dá para ler de volta (é assim de propósito). Pegue o token
+> de novo com o @BotFather e rode `bot.py --diagnosticar-telegram` para
+> redescobrir o ID do grupo.
+
+### 4. Pronto
+
+O Railway detecta o Python sozinho, instala o `requirements.txt` e roda
+`python bot.py --loop` (está definido no `Procfile` e no `railway.json`).
+
+Acompanhe pela aba **Deploy Logs**. Você deve ver:
+
+```
+MODO CONTINUO ligado — verificando a cada 60 segundos.
+PRIMEIRA RODADA: guardei 50 produtos como ponto de partida, sem enviar mensagem.
+```
+
+A partir daí chegam só os lançamentos novos, em menos de 1 minuto.
+
+### Se o bot reiniciar
+
+Ao publicar uma atualização ou se o servidor reiniciar, a memória recomeça
+e o bot faz uma nova "primeira rodada" — guarda os 50 atuais **sem avisar**.
+Você não recebe mensagem repetida; no máximo deixa de ser avisado dos
+produtos publicados durante o reinício (segundos).
 
 ---
 
@@ -238,7 +190,8 @@ Se um dia o atraso incomodar, a solução é um servidor pequeno sempre ligado
 | Arquivo | Para que serve |
 |---|---|
 | `bot.py` | O programa. Todo comentado em português. |
-| `.github/workflows/bot.yml` | Diz ao GitHub quando e como rodar o bot. |
+| `Procfile` / `railway.json` | Dizem ao Railway como rodar o bot. |
+| `.github/workflows/bot.yml` | Disparo manual de reserva pelo GitHub. |
 | `vistos.txt` | Memória: os produtos que ele já avisou. Criado sozinho. |
 | `requirements.txt` | Lista do que o GitHub precisa instalar antes de rodar. |
 | `.env.example` | Modelo de configuração. Só serve se você rodar no seu Mac. |
