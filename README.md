@@ -40,31 +40,31 @@ cadastrados **hoje**. Os produtos vêm de Taobao, Weidian e 1688.
 ### O que chega no seu grupo
 
 ```
-🆕 Camisa Polo Masculina Novo Verão 2025 Camiseta Patchwork Top
-2025 New Summer Men's Polo Shirt T-Shirt Patchwork Top          ← original
-T-shirts · Weidian
-Preço: CN¥ 30.19
+🆕 Unisex Chest Bag Multi-functional Mobile Phone Bag Waist Bag
+Hat&Bags · Taobao
+Preço: CN¥ 57,50
 Ver no CSSDeals    ← link clicável
 [foto do produto]
 ```
 
-**Os títulos são traduzidos automaticamente para português.** O original vem
-logo abaixo, em itálico — útil pra procurar o produto no site.
+**Preços em Yuan (CN¥)**, como o site publica.
+**Títulos sem tradução**, exatamente como estão no anúncio.
 
-A tradução usa o MyMemory, que é gratuito e **não precisa de cadastro nem
-senha**. Detalhes honestos sobre ele:
+> Alguns títulos já vêm em português — isso é o próprio site publicando
+> assim, não tradução do bot.
 
-- Títulos em **chinês** traduzem bem — que é o caso que mais atrapalha
-- Alguns títulos em **inglês** voltam sem tradução (limitação do serviço
-  gratuito). Como já eram legíveis, não atrapalha
-- Cada tradução fica **guardada no banco**. O mesmo título nunca é traduzido
-  duas vezes, o que economiza a cota
-- Se a tradução falhar ou a cota do dia acabar, **você continua recebendo a
-  notificação**, só que com o título original. Nunca deixa de avisar
+#### Se um dia quiser mudar
 
-Para desligar a tradução, coloque `TRADUZIR=nao` no `.env`.
-Se a cota apertar, preencha `TRADUCAO_EMAIL=seuemail@exemplo.com` no `.env` —
-aumenta bastante o limite diário (não precisa criar conta, é só informar).
+No Railway, aba **Variables**:
+
+| Variável | Para quê |
+|---|---|
+| `MOSTRAR_REAL=sim` | Mostra também o valor convertido: `CN¥ 57,50 (~R$ 44,03)` |
+| `TRADUZIR=sim` | Traduz os títulos para português |
+
+A conversão usa cotação real do dia (AwesomeAPI, com ExchangeRate de
+reserva) e é buscada uma vez por hora. Se as duas fontes falharem, o preço
+aparece só em Yuan — nunca deixa de te avisar por causa disso.
 
 ### Primeira vez que rodar
 

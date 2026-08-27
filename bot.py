@@ -108,6 +108,20 @@ MAX_NOTIFICACOES_POR_RODADA = 20  # trava de seguranca contra spam
 # Os titulos vem do site em chines e ingles. O bot traduz para portugues
 # usando o MyMemory, que e gratuito e NAO precisa de cadastro nem chave.
 API_TRADUCAO = "https://api.mymemory.translated.net/get"
+
+# --- Conversao de Yuan (CN¥) para Real (R$) ---
+# Duas fontes gratuitas, sem cadastro. A segunda so e usada se a
+# primeira falhar. A cotacao e buscada uma vez por hora, nao a cada
+# produto.
+FONTES_COTACAO = [
+    ("AwesomeAPI", "https://economia.awesomeapi.com.br/last/CNY-BRL"),
+    ("ExchangeRate", "https://open.er-api.com/v6/latest/CNY"),
+]
+VALIDADE_COTACAO = 3600   # segundos (1 hora)
+
+# Mostrar tambem o valor em reais? Desligado: os precos aparecem so em
+# Yuan, como o site publica. Para ligar, use MOSTRAR_REAL=sim no .env.
+_mostrar_real = False
 IDIOMA_DESTINO = "pt-BR"
 DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
 LIMITE_TEXTO_TRADUCAO = 480   # o MyMemory aceita ate ~500 caracteres por vez
@@ -381,9 +395,8 @@ def montar_item(registro: dict) -> Optional[dict]:
     primeiro_sku = skus[0] if skus else {}
     imagem = str(primeiro_sku.get("image") or registro.get("thumbnail") or "").strip()
 
-    # Preco (a API devolve em yuan)
-    valor = primeiro_sku.get("price")
-    preco = f"CN¥ {valor}" if valor is not None else ""
+    # Preco: a API devolve em yuan; converte para real tambem
+    preco = montar_preco(primeiro_sku.get("price"))
 
     return {
         "id": produto_id,                                   # id do proprio site
@@ -454,6 +467,91 @@ def salvar_estado(caminho: str, ids: list) -> None:
         os.replace(temporario, caminho)
     except OSError as erro:
         log.error("Nao consegui gravar a memoria em %s: %s", caminho, erro)
+
+
+# ==========================================================================
+#  5.4 COTACAO: CONVERTER YUAN PARA REAL
+# ==========================================================================
+#  Os precos do site vem em Yuan chines. Aqui viram reais, para voce nao
+#  precisar fazer a conta de cabeca a cada anuncio.
+# ==========================================================================
+
+# Guarda a ultima cotacao e a hora em que foi buscada
+_cotacao = {"valor": None, "quando": 0.0}
+
+
+def cotacao_cny_brl() -> Optional[float]:
+    """
+    Quanto vale 1 Yuan em reais.
+
+    Busca uma vez por hora e reaproveita. Se as duas fontes falharem,
+    devolve None — e o bot mostra so o preco em Yuan, sem quebrar.
+    """
+    agora = time.time()
+    if _cotacao["valor"] and (agora - _cotacao["quando"]) < VALIDADE_COTACAO:
+        return _cotacao["valor"]
+
+    for nome, url in FONTES_COTACAO:
+        try:
+            resposta = requests.get(
+                url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT
+            )
+            resposta.raise_for_status()
+            corpo = resposta.json()
+
+            if "awesomeapi" in url:
+                valor = float(corpo["CNYBRL"]["bid"])
+            else:
+                valor = float(corpo["rates"]["BRL"])
+
+            # Sanidade: se vier um numero absurdo, e sinal de que a
+            # fonte mudou o formato — melhor ignorar do que mostrar
+            # um preco errado para voce.
+            if not (0.1 < valor < 10):
+                log.warning("Cotacao suspeita da %s: %s. Ignorando.", nome, valor)
+                continue
+
+            _cotacao["valor"] = valor
+            _cotacao["quando"] = agora
+            log.info("Cotacao (%s): 1 CN¥ = R$ %.4f", nome, valor)
+            return valor
+
+        except Exception as erro:
+            log.warning("Fonte de cotacao %s falhou: %s", nome, str(erro)[:80])
+
+    log.warning("Nenhuma fonte de cotacao respondeu. Mostrando so em Yuan.")
+    return None
+
+
+def formatar_numero(valor: float) -> str:
+    """Formata no padrao brasileiro: 1.234,56 em vez de 1,234.56."""
+    texto = "{:,.2f}".format(valor)
+    return texto.replace(",", "\x00").replace(".", ",").replace("\x00", ".")
+
+
+def montar_preco(valor_yuan) -> str:
+    """
+    Monta o texto do preco: Yuan e, quando possivel, o valor em reais.
+
+    Exemplo:  CN¥ 30,19  (~R$ 23,12)
+    """
+    if valor_yuan is None:
+        return ""
+
+    try:
+        yuan = float(valor_yuan)
+    except (TypeError, ValueError):
+        return ""
+
+    texto = "CN¥ {}".format(formatar_numero(yuan))
+
+    # So consulta a cotacao se voce tiver pedido a conversao
+    if _mostrar_real:
+        taxa = cotacao_cny_brl()
+        if taxa:
+            texto += "  (~R$ {})".format(formatar_numero(yuan * taxa))
+
+    return texto
 
 
 # ==========================================================================
@@ -843,14 +941,18 @@ def carregar_config() -> dict:
         # Preenchido = so daquela aba (ex: 11 para Shoes, 32 para Hoodie).
         "categoria": os.getenv("CATEGORIA_ID", "").strip(),
         # Traduzir os titulos para portugues? (sim por padrao)
-        "traduzir": os.getenv("TRADUZIR", "sim").strip().lower()
-                    not in ("nao", "não", "no", "0", "false"),
+        # Desligada por padrao: os titulos vao como o site publica.
+        # Para ligar, use TRADUZIR=sim.
+        "traduzir": os.getenv("TRADUZIR", "nao").strip().lower()
+                    in ("sim", "yes", "1", "true"),
         # E-mail opcional: aumenta a cota diaria gratuita de traducao
         "traducao_email": os.getenv("TRADUCAO_EMAIL", "").strip(),
         # Se preenchido, usa arquivo de texto no lugar do banco SQLite.
         # E o modo usado quando o bot roda hospedado (GitHub Actions).
         "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
+        "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
+                        in ("sim", "yes", "1", "true"),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -879,10 +981,14 @@ def carregar_config() -> dict:
     else:
         log.info("Monitorando lancamentos de TODAS as abas do site.")
 
+    global _mostrar_real
+    _mostrar_real = config["mostrar_real"]
+    log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
+
     if config["traduzir"]:
         log.info("Traducao dos titulos para portugues: LIGADA.")
     else:
-        log.info("Traducao dos titulos: desligada (titulos no idioma original).")
+        log.info("Traducao: desligada — titulos como o site publica.")
 
     return config
 
