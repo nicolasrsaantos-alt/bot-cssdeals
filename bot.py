@@ -825,7 +825,22 @@ def _post_telegram(url: str, dados: dict) -> bool:
                 return False
 
             if resposta.status_code == 400:
-                log.error("TELEGRAM recusou a mensagem (400): %s", descricao)
+                # Caso especial: o grupo virou supergrupo e trocou de ID.
+                # O Telegram informa o ID novo na propria resposta — vamos
+                # mostra-lo, em vez de deixar voce procurando.
+                novo_id = corpo.get("parameters", {}).get("migrate_to_chat_id")
+                if novo_id:
+                    log.error("=" * 60)
+                    log.error("O GRUPO VIROU SUPERGRUPO E MUDOU DE ID.")
+                    log.error("")
+                    log.error("   ID antigo (o que esta configurado): %s", dados.get("chat_id"))
+                    log.error("   ID NOVO (use este):                 %s", novo_id)
+                    log.error("")
+                    log.error("   Troque TELEGRAM_CHAT_ID para %s", novo_id)
+                    log.error("   nas Variables do Railway. E so isso.")
+                    log.error("=" * 60)
+                else:
+                    log.error("TELEGRAM recusou a mensagem (400): %s", descricao)
                 return False
 
             log.warning(
