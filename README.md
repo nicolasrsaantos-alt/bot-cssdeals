@@ -53,6 +53,8 @@ ignora o pedido e volta ao mínimo, sem erro nenhum. O máximo real é **100**.
 Tamanho: L
 Hat&Bags · Taobao
 Preço: CN¥ 57,50
+
+——————————————————
 Ver no CSSDeals    ← link clicável
 [foto do produto]
 ```
@@ -301,6 +303,21 @@ uma (ex: só tênis), no repositório vá em:
 Alguns números: `11` Shoes · `32` Hoodie · `14` T-shirts · `15` Pants ·
 `12` Coat · `20` Watches · `26` Hat&Bags · `36` sports goods.
 A lista completa das 29 abas está no `.env.example`.
+
+---
+
+## Por que não existe "preço original riscado"
+
+O CSSDeals guarda **um preço só** por produto — não há campo de preço
+antigo, e `discount` vem sempre zerado. Não existe o que riscar.
+
+Buscar o valor no anúncio de origem foi testado e **descartado**:
+
+- **Taobao** (20% dos produtos): o `robots.txt` proíbe explicitamente
+  qualquer acesso automatizado que não seja do Googlebot
+- **1688** (52%): a primeira consulta funciona, mas as seguintes vêm
+  bloqueadas por proteção anti-bot (captcha/punish). Funcionaria hoje e
+  quebraria amanhã, sem aviso
 
 ---
 

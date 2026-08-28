@@ -851,7 +851,11 @@ def montar_texto_telegram(item: dict) -> str:
     if item.get("preco"):
         linhas.append("Preco: <b>{}</b>".format(escapar_html(item["preco"])))
 
+    # Uma linha em branco e um tracejado separam o link do resto,
+    # para ele nao competir com o preco pela atencao.
     if item.get("link"):
+        linhas.append("")
+        linhas.append("—" * 18)
         linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
 
     return "\n".join(linhas)
