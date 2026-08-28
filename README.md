@@ -50,11 +50,16 @@ ignora o pedido e volta ao mínimo, sem erro nenhum. O máximo real é **100**.
 
 ```
 🆕 Unisex Chest Bag Multi-functional Mobile Phone Bag Waist Bag
+Tamanho: L
 Hat&Bags · Taobao
 Preço: CN¥ 57,50
 Ver no CSSDeals    ← link clicável
 [foto do produto]
 ```
+
+**O tamanho aparece logo abaixo do nome.** Se o produto não tiver tamanho
+cadastrado (serviços, kits, eletrônicos), a linha simplesmente não aparece —
+em vez de mostrar um campo vazio.
 
 **Preços em Yuan (CN¥)**, como o site publica.
 **Títulos sem tradução**, exatamente como estão no anúncio.

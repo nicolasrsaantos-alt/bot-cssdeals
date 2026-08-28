@@ -207,6 +207,7 @@ def abrir_banco() -> sqlite3.Connection:
             id            TEXT PRIMARY KEY,   -- id do produto no proprio site
             titulo        TEXT NOT NULL,      -- titulo original (chines/ingles)
             titulo_pt     TEXT,               -- titulo traduzido para portugues
+            tamanho       TEXT,               -- tamanho do produto (P/M/G, 42...)
             imagem        TEXT,
             link          TEXT,
             preco         TEXT,
@@ -218,6 +219,13 @@ def abrir_banco() -> sqlite3.Connection:
         )
         """
     )
+    # Bancos criados antes desta versao nao tem a coluna 'tamanho'.
+    # Adiciona sem apagar nada do que ja estava salvo.
+    colunas = [c[1] for c in conexao.execute("PRAGMA table_info(itens)")]
+    if "tamanho" not in colunas:
+        conexao.execute("ALTER TABLE itens ADD COLUMN tamanho TEXT")
+        log.info("Banco atualizado: coluna 'tamanho' adicionada.")
+
     conexao.commit()
     return conexao
 
@@ -246,12 +254,13 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
     conexao.execute(
         """
         INSERT OR IGNORE INTO itens
-            (id, titulo, titulo_pt, imagem, link, preco, categoria, plataforma,
-             origem, visto_em, notificado)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, titulo, titulo_pt, tamanho, imagem, link, preco, categoria,
+             plataforma, origem, visto_em, notificado)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"], item["titulo"], item.get("titulo_pt", ""),
+            item.get("tamanho", ""),
             item["imagem"], item["link"],
             item["preco"], item["categoria"], item["plataforma"], item["origem"],
             datetime.now().isoformat(timespec="seconds"),
@@ -272,15 +281,15 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
     """
     cursor = conexao.execute(
         """
-        SELECT id, titulo, titulo_pt, imagem, link, preco, categoria,
-               plataforma, origem
+        SELECT id, titulo, titulo_pt, tamanho, imagem, link, preco,
+               categoria, plataforma, origem
         FROM itens WHERE notificado = 0 ORDER BY visto_em
         """
     )
     return [
-        {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "imagem": l[3],
-         "link": l[4], "preco": l[5], "categoria": l[6], "plataforma": l[7],
-         "origem": l[8]}
+        {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "tamanho": l[3],
+         "imagem": l[4], "link": l[5], "preco": l[6], "categoria": l[7],
+         "plataforma": l[8], "origem": l[9]}
         for l in cursor.fetchall()
     ]
 
@@ -444,10 +453,15 @@ def montar_item(registro: dict) -> Optional[dict]:
     # Preco: a API devolve em yuan; converte para real tambem
     preco = montar_preco(primeiro_sku.get("price"))
 
+    # Tamanho: vem do sku. Fica vazio em itens que nao sao roupa
+    # (servicos, kits) — nesses casos a linha nao aparece na mensagem.
+    tamanho = str(primeiro_sku.get("size") or "").strip()
+
     return {
         "id": produto_id,                                   # id do proprio site
         "titulo": titulo,
         "titulo_pt": "",                                    # preenchido depois
+        "tamanho": tamanho,
         "imagem": imagem,
         "link": URL_PRODUTO.format(id=produto_id),          # link de compra
         "preco": preco,
@@ -820,6 +834,11 @@ def montar_texto_telegram(item: dict) -> str:
     """Monta a mensagem no formato HTML do Telegram (negrito, link clicavel)."""
     linhas = ["\U0001F195 <b>{}</b>".format(escapar_html(titulo_visivel(item)))]
 
+    # Tamanho vem logo abaixo do nome. Se o produto nao tiver, a linha
+    # simplesmente nao aparece.
+    if item.get("tamanho"):
+        linhas.append("Tamanho: <b>{}</b>".format(escapar_html(item["tamanho"])))
+
     # Mostra o titulo original tambem — util para procurar o produto no site
     original = item["titulo"]
     if original and original != titulo_visivel(item):
@@ -968,6 +987,8 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
         embed["image"] = {"url": item["imagem"]}
 
     detalhes = []
+    if item.get("tamanho"):
+        detalhes.append("**Tamanho:** {}".format(item["tamanho"]))
     original = item["titulo"]
     if original and original != titulo_visivel(item):
         detalhes.append("*{}*".format(original[:200]))
@@ -1401,6 +1422,7 @@ def testar_notificacao(config: dict) -> bool:
         "id": "teste",
         "titulo": "Teste do bot — se voce esta lendo isso, funcionou!",
         "titulo_pt": "",
+        "tamanho": "",
         "imagem": "",
         "link": "",
         "preco": "",
