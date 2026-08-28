@@ -1536,12 +1536,50 @@ def diagnosticar_telegram() -> None:
     webhook = chamar("getWebhookInfo")
     url_webhook = (webhook.get("result") or {}).get("url") or ""
     if url_webhook:
-        print("      X TEM UM WEBHOOK ATIVO: {}".format(url_webhook[:60]))
-        print("      Enquanto ele existir, o bot NAO consegue ler as mensagens.")
-        print("      Remova abrindo este endereco no navegador:")
-        print("      {}/deleteWebhook".format(base))
+        # ATENCAO: webhook NAO impede o envio de alertas. Ele so impede
+        # LER mensagens (getUpdates). Se outro servico registrou esse
+        # webhook (AccessManager, gateway de pagamento, etc), apaga-lo
+        # QUEBRARIA aquele servico. Por isso nao mandamos apagar.
+        print("      Existe um webhook ativo: {}...".format(url_webhook[:45]))
+        print()
+        print("      Isso NAO atrapalha os alertas — o bot so precisa ENVIAR,")
+        print("      e enviar continua funcionando normalmente.")
+        print()
+        print("      NAO APAGUE esse webhook: ele provavelmente pertence a")
+        print("      outro servico ligado ao seu bot (gateway de pagamento,")
+        print("      controle de assinatura). Apagar quebraria aquele servico.")
+        print()
+        print("      So nao da para descobrir o ID do grupo automaticamente")
+        print("      enquanto ele existir. Vou pedir o ID e testar o envio.")
+        print()
+
+        chat_id = _perguntar("      Cole o TELEGRAM_CHAT_ID (o mesmo do Railway): ")
+        if not chat_id:
+            print("      Sem o ID nao da para testar. Ele esta nas Variables do Railway.")
+            return
+
+        print()
+        print("  [3] Mandando uma mensagem de TESTE...")
+        print()
+        ok = enviar_telegram(
+            {"titulo": "Teste do bot — se voce esta lendo isso, o envio funciona!",
+             "titulo_pt": "", "imagem": "", "link": "", "preco": "",
+             "categoria": "", "plataforma": ""},
+            token, chat_id,
+        )
+        print()
+        print("=" * 64)
+        if ok:
+            print("  ENVIADO! Token, ID e permissao estao OK.")
+            print("  Se a mensagem chegou, os alertas vao chegar tambem.")
+        else:
+            print("  FALHOU. Veja o erro acima.")
+            print("  Causa mais comum: o bot deixou de ser administrador do")
+            print("  grupo (remover e readicionar zera as permissoes dele).")
+        print("=" * 64)
         return
-    print("      OK - nenhum webhook atrapalhando")
+
+    print("      OK - nenhum webhook configurado")
 
     # ---- 3. o que o bot recebeu? ----
     print()
