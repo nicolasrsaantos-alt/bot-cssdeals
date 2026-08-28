@@ -74,8 +74,20 @@ TAMANHO_PAGINA = 100          # maximo aceito pela API (acima disso ela devolve 
 #  bem mais funda procurando qualquer ID que ainda nao conheca,
 #  independentemente da posicao.
 PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
-MINUTOS_ENTRE_VARREDURAS = 20
-DELAY_ENTRE_PAGINAS = 1.5
+
+# MEDIDO EM 28/08/2026: das 5 publicacoes observadas em 3 horas,
+# NENHUMA caiu dentro dos 100 do topo. Elas entraram nas posicoes
+# 317, 324, 485, 573 e 783.
+#
+# Ou seja: a leitura rasa nao pega quase nada neste site — quem faz o
+# trabalho e a varredura profunda. Por isso ela roda a cada 5 minutos,
+# e nao a cada 20: o intervalo dela E o atraso real dos seus avisos.
+#
+# 5 minutos = 10 requisicoes a cada 5 min (~120 por hora). E um ritmo
+# defensavel para monitoramento; nao baixe muito mais que isso sem
+# necessidade, por respeito ao servidor do site.
+MINUTOS_ENTRE_VARREDURAS = 5
+DELAY_ENTRE_PAGINAS = 1.0
 
 # Detalhe de um produto: e o unico lugar que traz TODAS as fotos do
 # anuncio feito no CSSDeals. A listagem devolve so uma imagem, que as
