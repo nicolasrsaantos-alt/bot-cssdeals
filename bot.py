@@ -1540,7 +1540,40 @@ def diagnosticar_telegram() -> None:
         # LER mensagens (getUpdates). Se outro servico registrou esse
         # webhook (AccessManager, gateway de pagamento, etc), apaga-lo
         # QUEBRARIA aquele servico. Por isso nao mandamos apagar.
+        info = webhook.get("result") or {}
         print("      Existe um webhook ativo: {}...".format(url_webhook[:45]))
+        print()
+
+        # --- saude da entrega: diz se o servico dono do webhook responde ---
+        pendentes = info.get("pending_update_count", 0)
+        erro_msg = info.get("last_error_message")
+        erro_data = info.get("last_error_date")
+
+        print("      SAUDE DA ENTREGA (util se o bot nao responde):")
+        print("        mensagens na fila esperando: {}".format(pendentes))
+
+        if erro_msg:
+            quando = ""
+            if erro_data:
+                quando = datetime.fromtimestamp(erro_data).strftime(" em %d/%m %H:%M")
+            print("        ULTIMO ERRO{}: {}".format(quando, str(erro_msg)[:70]))
+            print()
+            print("        >> O Telegram esta tentando entregar e FALHANDO.")
+            print("           O servico dono do webhook esta fora do ar ou")
+            print("           recusando. Fale com o suporte dele.")
+        elif pendentes > 5:
+            print()
+            print("        >> Sem erro de entrega, mas {} mensagens empilhadas.".format(pendentes))
+            print("           O servico recebe mas nao esta processando —")
+            print("           provavelmente falta configura-lo no painel dele")
+            print("           (mensagem de boas-vindas, plano, pagamento).")
+        else:
+            print("        nenhum erro de entrega registrado")
+            print()
+            print("        >> O Telegram ENTREGA normalmente ao servico.")
+            print("           Se o bot nao responde, o problema esta na")
+            print("           configuracao dentro do painel do servico,")
+            print("           nao na conexao nem no seu bot de alertas.")
         print()
         print("      Isso NAO atrapalha os alertas — o bot so precisa ENVIAR,")
         print("      e enviar continua funcionando normalmente.")
