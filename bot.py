@@ -77,6 +77,15 @@ PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 MINUTOS_ENTRE_VARREDURAS = 20
 DELAY_ENTRE_PAGINAS = 1.5
 
+# Detalhe de um produto: e o unico lugar que traz TODAS as fotos do
+# anuncio feito no CSSDeals. A listagem devolve so uma imagem, que as
+# vezes vem do site de origem (1688/Taobao/Weidian) em vez do CSSDeals.
+API_DETALHE = SITE_BASE + "/api/product/{id}"
+
+# Qual foto usar: 0 = primeira, 1 = segunda, e assim por diante.
+# A segunda costuma mostrar melhor o produto que a capa.
+FOTO_ESCOLHIDA = 1
+
 # Pagina do link de compra de cada produto
 URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
 
@@ -492,6 +501,77 @@ def salvar_estado(caminho: str, ids: list) -> None:
         os.replace(temporario, caminho)
     except OSError as erro:
         log.error("Nao consegui gravar a memoria em %s: %s", caminho, erro)
+
+
+# ==========================================================================
+#  5.3 FOTOS DO ANUNCIO NO CSSDEALS
+# ==========================================================================
+#  A listagem devolve uma imagem so, e as vezes ela aponta para o site de
+#  origem (1688, Taobao, Weidian) em vez do CSSDeals.
+#
+#  As fotos do anuncio feito no CSSDeals so aparecem no endpoint de
+#  detalhe. Buscamos de la a foto escolhida (por padrao a segunda).
+#
+#  Isso e feito SO para os produtos que serao avisados — nunca para os
+#  1000 da varredura profunda.
+# ==========================================================================
+
+def buscar_foto(produto_id: str, sessao: Optional[requests.Session] = None) -> Optional[str]:
+    """
+    Pega a foto do anuncio no CSSDeals (a segunda, por padrao).
+
+    Se o detalhe falhar ou o produto tiver so uma foto, devolve o que der
+    — e quem chamou mantem a imagem antiga. Nunca deixa de notificar por
+    causa de foto.
+    """
+    try:
+        pedir = (sessao or requests).get
+        resposta = pedir(API_DETALHE.format(id=produto_id),
+                         headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except Exception as erro:
+        log.warning("Nao consegui as fotos de %s (%s).", produto_id, str(erro)[:60])
+        return None
+
+    if corpo.get("code") != 0:
+        return None
+
+    fotos = ((corpo.get("data") or {}).get("images")) or []
+    enderecos = [f.get("url") for f in fotos if f.get("url")]
+    if not enderecos:
+        return None
+
+    # Pede a segunda; se so houver uma, fica com a que existe
+    if FOTO_ESCOLHIDA < len(enderecos):
+        return enderecos[FOTO_ESCOLHIDA]
+    return enderecos[-1]
+
+
+def aplicar_fotos(itens: list, conexao=None) -> None:
+    """
+    Troca a imagem dos itens pela foto do anuncio no CSSDeals.
+
+    Chamado logo antes de avisar, so nos itens que vao ser enviados.
+    """
+    if not itens:
+        return
+
+    trocadas = 0
+    for item in itens:
+        foto = buscar_foto(item["id"])
+        if foto and foto != item.get("imagem"):
+            item["imagem"] = foto
+            trocadas += 1
+            if conexao is not None:
+                conexao.execute("UPDATE itens SET imagem = ? WHERE id = ?",
+                                (foto, item["id"]))
+        time.sleep(0.4)   # educacao com o servidor
+
+    if conexao is not None:
+        conexao.commit()
+    if trocadas:
+        log.info("Foto do anuncio do CSSDeals aplicada em %s item(ns).", trocadas)
 
 
 # ==========================================================================
@@ -1149,6 +1229,8 @@ def rodar_coleta(config: dict) -> None:
                 len(pendentes), MAX_NOTIFICACOES_POR_RODADA,
             )
 
+        aplicar_fotos(a_enviar, conexao)
+
         for numero, item in enumerate(a_enviar, 1):
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
             if notificar(item, config):
@@ -1280,6 +1362,8 @@ def rodar_coleta_arquivo(config: dict) -> None:
         log.info("Traduzindo %s titulo(s) para portugues...", len(a_enviar))
         for item in a_enviar:
             item["titulo_pt"] = traduzir(item["titulo"], None, config["traducao_email"])
+
+    aplicar_fotos(a_enviar)
 
     erros = 0
     for numero, item in enumerate(a_enviar, 1):

@@ -58,6 +58,19 @@ Ver no CSSDeals    ← link clicável
 
 **Preços em Yuan (CN¥)**, como o site publica.
 **Títulos sem tradução**, exatamente como estão no anúncio.
+**Foto: a segunda imagem do anúncio feito no CSSDeals.**
+
+> **Por que a segunda foto:** a listagem da API devolve uma imagem só, e
+> em boa parte dos produtos ela aponta para o site de origem (1688, Taobao,
+> Weidian) em vez do CSSDeals. As fotos do anúncio do CSSDeals só existem
+> no endpoint de detalhe — o bot busca lá e usa a segunda, que costuma
+> mostrar melhor o produto que a capa.
+>
+> Se o produto tiver só uma foto, usa essa. Se a busca falhar, usa a da
+> listagem — nunca deixa de avisar por causa de imagem.
+>
+> Para mudar qual foto, ajuste `FOTO_ESCOLHIDA` no topo do `bot.py`
+> (`0` = primeira, `1` = segunda, `2` = terceira...).
 
 > Alguns títulos já vêm em português — isso é o próprio site publicando
 > assim, não tradução do bot.
