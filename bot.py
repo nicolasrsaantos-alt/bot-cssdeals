@@ -86,8 +86,19 @@ PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 # 5 minutos = 10 requisicoes a cada 5 min (~120 por hora). E um ritmo
 # defensavel para monitoramento; nao baixe muito mais que isso sem
 # necessidade, por respeito ao servidor do site.
-MINUTOS_ENTRE_VARREDURAS = 5
+# Valor padrao; o real e lido do .env em carregar_config().
+# Cada varredura = 10 requisicoes ao site. A cada 2 min sao ~300 por
+# hora — ritmo defensavel. Descer para 1 min dobraria isso, e o risco
+# nao e etico e sim pratico: site que bloqueia seu IP te deixa com
+# ZERO alertas, o que e muito pior que 2 minutos de atraso.
+VARREDURA_PADRAO_MIN = 2
 DELAY_ENTRE_PAGINAS = 1.0
+
+# Quantas paginas buscar ao mesmo tempo na varredura profunda.
+# NAO aumenta o numero de requisicoes — apenas evita que uma espere a
+# outra. A varredura cai de ~25s para ~3s, e esse tempo saia do seu
+# atraso. 4 simultaneas e um meio-termo: rapido sem parecer ataque.
+PAGINAS_SIMULTANEAS = 4
 
 # Detalhe de um produto: e o unico lugar que traz TODAS as fotos do
 # anuncio feito no CSSDeals. A listagem devolve so uma imagem, que as
@@ -363,69 +374,71 @@ def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
     return None
 
 
+def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
+    """Busca UMA pagina. Devolve (numero, registros) ou (numero, None)."""
+    parametros = {
+        "fields": 1, "categoryId": categoria, "page": numero,
+        "pageSize": TAMANHO_PAGINA, "priceMin": "0.00", "priceMax": "99999.00",
+    }
+    try:
+        resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except requests.exceptions.Timeout:
+        log.error("Timeout na pagina %s.", numero)
+        return numero, None
+    except requests.exceptions.ConnectionError:
+        log.error("Conexao recusada na pagina %s.", numero)
+        return numero, None
+    except Exception as erro:
+        log.error("Erro na pagina %s: %s", numero, str(erro)[:70])
+        return numero, None
+
+    if corpo.get("code") != 0:
+        log.error("A API recusou a pagina %s: %s", numero, corpo.get("msg"))
+        return numero, None
+
+    dados = corpo.get("data") or {}
+    if numero == 1 and dados.get("total") is not None:
+        log.info("Catalogo do site tem %s produtos no total.", dados["total"])
+    return numero, (dados.get("records") or [])
+
+
 def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
                        paginas: int = 1) -> Optional[list]:
     """
-    Pergunta a API do site quais produtos existem, do mais recente para o
-    mais antigo.
+    Le os produtos do site, do mais recente para o mais antigo.
 
-    `paginas=1` e a leitura rapida de rotina (so o topo).
-    `paginas=10` e a varredura profunda, que procura produtos que ficaram
-    visiveis agora mas foram criados ha dias — esses nascem no meio da
-    lista e o topo nunca os mostra.
+    `paginas=1` e a leitura rapida. Valores maiores fazem a varredura
+    profunda, que busca as paginas EM PARALELO para nao somar espera ao
+    seu atraso — sao as mesmas requisicoes, so que sem fila.
     """
+    if paginas == 1:
+        _, registros = _buscar_pagina(sessao, categoria, 1)
+        return registros
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    resultados = {}
+    with ThreadPoolExecutor(max_workers=PAGINAS_SIMULTANEAS) as executor:
+        tarefas = [executor.submit(_buscar_pagina, sessao, categoria, n)
+                   for n in range(1, paginas + 1)]
+        for tarefa in tarefas:
+            numero, registros = tarefa.result()
+            resultados[numero] = registros
+
+    # Remonta na ordem certa; para na primeira pagina que falhou ou
+    # veio incompleta (fim do catalogo)
     todos = []
-
     for numero in range(1, paginas + 1):
-        parametros = {
-            "fields": 1,
-            "categoryId": categoria,
-            "page": numero,
-            "pageSize": TAMANHO_PAGINA,
-            "priceMin": "0.00",
-            "priceMax": "99999.00",
-        }
-
-        try:
-            resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
-            resposta.raise_for_status()
-            corpo = resposta.json()
-        except requests.exceptions.Timeout:
-            log.error("Timeout: o site demorou mais de %ss para responder.", TIMEOUT)
-            return todos or None
-        except requests.exceptions.ConnectionError:
-            log.error("Conexao recusada ou sem internet.")
-            return todos or None
-        except requests.exceptions.HTTPError as erro:
-            log.error("O site respondeu com erro: %s", erro)
-            return todos or None
-        except ValueError:
-            log.error("O site respondeu algo que nao e JSON (a API pode ter mudado).")
-            return todos or None
-        except Exception as erro:
-            log.error("Erro inesperado ao consultar a API: %s", erro)
-            return todos or None
-
-        if corpo.get("code") != 0:
-            log.error("A API recusou a consulta: %s", corpo.get("msg") or corpo.get("code"))
-            return todos or None
-
-        dados = corpo.get("data") or {}
-        registros = dados.get("records") or []
-
-        if numero == 1 and dados.get("total") is not None:
-            log.info("Catalogo do site tem %s produtos no total.", dados["total"])
-
+        registros = resultados.get(numero)
+        if registros is None:
+            break
         todos.extend(registros)
-
-        # Pagina veio incompleta = chegamos ao fim do catalogo
         if len(registros) < TAMANHO_PAGINA:
             break
 
-        if numero < paginas:
-            time.sleep(DELAY_ENTRE_PAGINAS)   # educacao com o servidor
-
-    return todos
+    return todos or None
 
 
 def montar_item(registro: dict) -> Optional[dict]:
@@ -1070,7 +1083,7 @@ def notificar(item: dict, config: dict) -> bool:
 #  7. CONFIGURACAO (.env)
 # ==========================================================================
 
-def _inteiro_do_ambiente(nome: str, padrao: int) -> int:
+def _inteiro_do_ambiente(nome: str, padrao: int, minimo: int = 10) -> int:
     """Le um numero do .env; se estiver vazio ou escrito errado, usa o padrao."""
     bruto = os.getenv(nome, "").strip()
     if not bruto:
@@ -1080,9 +1093,10 @@ def _inteiro_do_ambiente(nome: str, padrao: int) -> int:
     except ValueError:
         log.warning("%s='%s' nao e um numero. Usando %s.", nome, bruto, padrao)
         return padrao
-    if valor < 10:
-        log.warning("%s=%s e agressivo demais com o site. Usando 10.", nome, valor)
-        return 10
+    if valor < minimo:
+        log.warning("%s=%s e agressivo demais com o site. Usando %s.",
+                    nome, valor, minimo)
+        return minimo
     return valor
 
 
@@ -1108,6 +1122,8 @@ def carregar_config() -> dict:
         # E o modo usado quando o bot roda hospedado (GitHub Actions).
         "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
+        "varredura_min": _inteiro_do_ambiente(
+            "MINUTOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_MIN, minimo=1),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
                         in ("sim", "yes", "1", "true"),
     }
@@ -1141,6 +1157,8 @@ def carregar_config() -> dict:
     global _mostrar_real
     _mostrar_real = config["mostrar_real"]
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
+    log.info("Varredura profunda a cada %s minuto(s) — e ela que define "
+             "o atraso dos avisos.", config["varredura_min"])
 
     if config["traduzir"]:
         log.info("Traducao dos titulos para portugues: LIGADA.")
@@ -1170,7 +1188,7 @@ def rodar_coleta(config: dict) -> None:
     primeira_vez = banco_vazio(conexao)
 
     # Passo 1: buscar os produtos mais recentes na API do site
-    paginas, profunda = paginas_desta_rodada(primeira_vez)
+    paginas, profunda = paginas_desta_rodada(primeira_vez, config["varredura_min"])
     if profunda:
         log.info(
             "Varredura PROFUNDA: lendo %s paginas (~%s produtos) para achar "
@@ -1291,7 +1309,7 @@ def rodar_coleta(config: dict) -> None:
 _ultima_varredura = 0.0
 
 
-def paginas_desta_rodada(primeira_vez: bool) -> tuple:
+def paginas_desta_rodada(primeira_vez: bool, minutos: int = VARREDURA_PADRAO_MIN) -> tuple:
     """
     Decide se esta rodada le so o topo ou faz a varredura profunda.
 
@@ -1304,7 +1322,7 @@ def paginas_desta_rodada(primeira_vez: bool) -> tuple:
     global _ultima_varredura
 
     agora = time.time()
-    passou = (agora - _ultima_varredura) >= MINUTOS_ENTRE_VARREDURAS * 60
+    passou = (agora - _ultima_varredura) >= minutos * 60
 
     if primeira_vez or passou:
         _ultima_varredura = agora
@@ -1345,7 +1363,7 @@ def rodar_coleta_arquivo(config: dict) -> None:
     conjunto = set(ja_vistos)
     primeira_vez = not ja_vistos
 
-    paginas, profunda = paginas_desta_rodada(primeira_vez)
+    paginas, profunda = paginas_desta_rodada(primeira_vez, config["varredura_min"])
     if profunda:
         log.info("Varredura PROFUNDA: lendo %s paginas (~%s produtos).",
                  paginas, paginas * TAMANHO_PAGINA)
