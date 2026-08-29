@@ -115,9 +115,9 @@ PAGINAS_RAPIDAS = 2
 # vezes vem do site de origem (1688/Taobao/Weidian) em vez do CSSDeals.
 API_DETALHE = SITE_BASE + "/api/product/{id}"
 
-# Qual foto usar: 0 = primeira, 1 = segunda, e assim por diante.
-# A segunda costuma mostrar melhor o produto que a capa.
-FOTO_ESCOLHIDA = 1
+# Qual foto do anuncio usar: 0 = primeira, 1 = segunda, e assim por diante.
+# Valor padrao; o real e lido do .env em carregar_config().
+FOTO_PADRAO = 0
 
 # Pagina do link de compra de cada produto
 URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
@@ -177,6 +177,9 @@ VALIDADE_COTACAO = 3600   # segundos (1 hora)
 # Mostrar tambem o valor em reais? Desligado: os precos aparecem so em
 # Yuan, como o site publica. Para ligar, use MOSTRAR_REAL=sim no .env.
 _mostrar_real = False
+
+# Indice da foto usada nos avisos (definido em carregar_config)
+_foto_escolhida = FOTO_PADRAO
 IDIOMA_DESTINO = "pt-BR"
 DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
 LIMITE_TEXTO_TRADUCAO = 480   # o MyMemory aceita ate ~500 caracteres por vez
@@ -591,9 +594,10 @@ def buscar_foto(produto_id: str, sessao: Optional[requests.Session] = None) -> O
     if not enderecos:
         return None
 
-    # Pede a segunda; se so houver uma, fica com a que existe
-    if FOTO_ESCOLHIDA < len(enderecos):
-        return enderecos[FOTO_ESCOLHIDA]
+    # Pede a foto escolhida; se o produto tiver menos fotos que isso,
+    # fica com a ultima que existe
+    if _foto_escolhida < len(enderecos):
+        return enderecos[_foto_escolhida]
     return enderecos[-1]
 
 
@@ -1136,6 +1140,8 @@ def carregar_config() -> dict:
             "MINUTOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_MIN, minimo=1),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
                         in ("sim", "yes", "1", "true"),
+        # 0 = primeira foto do anuncio, 1 = segunda, e assim por diante
+        "foto": _inteiro_do_ambiente("FOTO_DO_ANUNCIO", FOTO_PADRAO, minimo=0),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1164,8 +1170,10 @@ def carregar_config() -> dict:
     else:
         log.info("Monitorando lancamentos de TODAS as abas do site.")
 
-    global _mostrar_real
+    global _mostrar_real, _foto_escolhida
     _mostrar_real = config["mostrar_real"]
+    _foto_escolhida = config["foto"]
+    log.info("Foto usada nos avisos: a %sa do anuncio.", _foto_escolhida + 1)
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
     log.info("Varredura profunda a cada %s minuto(s) — e ela que define "
              "o atraso dos avisos.", config["varredura_min"])
