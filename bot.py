@@ -100,6 +100,16 @@ DELAY_ENTRE_PAGINAS = 1.0
 # atraso. 4 simultaneas e um meio-termo: rapido sem parecer ataque.
 PAGINAS_SIMULTANEAS = 4
 
+# Paginas da leitura RAPIDA (a de cada ciclo).
+#
+# MEDIDO EM 29/08/2026, manha: das 11 publicacoes, 8 cairam nos 100
+# primeiros e 3 nas posicoes 103, 116 e 132 — escapando por pouco de
+# uma leitura de 1 pagina. Com 2 paginas (200 produtos), as 11 seriam
+# pegas no ciclo rapido.
+#
+# Custo: 1 requisicao a mais por ciclo (~60 por hora).
+PAGINAS_RAPIDAS = 2
+
 # Detalhe de um produto: e o unico lugar que traz TODAS as fotos do
 # anuncio feito no CSSDeals. A listagem devolve so uma imagem, que as
 # vezes vem do site de origem (1688/Taobao/Weidian) em vez do CSSDeals.
@@ -413,7 +423,7 @@ def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
     profunda, que busca as paginas EM PARALELO para nao somar espera ao
     seu atraso — sao as mesmas requisicoes, so que sem fila.
     """
-    if paginas == 1:
+    if paginas <= 1:
         _, registros = _buscar_pagina(sessao, categoria, 1)
         return registros
 
@@ -1328,7 +1338,7 @@ def paginas_desta_rodada(primeira_vez: bool, minutos: int = VARREDURA_PADRAO_MIN
         _ultima_varredura = agora
         return PAGINAS_PROFUNDAS, True
 
-    return 1, False
+    return PAGINAS_RAPIDAS, False
 
 
 def executar_rodada(config: dict) -> None:
