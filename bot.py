@@ -119,8 +119,17 @@ API_DETALHE = SITE_BASE + "/api/product/{id}"
 # Valor padrao; o real e lido do .env em carregar_config().
 FOTO_PADRAO = 0
 
-# Pagina do link de compra de cada produto
+# Pagina do produto no CSSDeals
 URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
+
+# Link que joga o produto direto no carrinho do CSSBuy.
+#
+# Descoberto no main.js do site: o botao "Buy Now" faz
+#     POST /api/cart {productId, quantity}
+# e recebe de volta um redirectUrl com este formato. Como ele so depende
+# do id do produto no CSSDeals — que ja temos —, da para montar aqui
+# mesmo, sem requisicao nenhuma.
+URL_COMPRA = "https://www.cssbuy.com/waiting?type=cssdeals&productId={id}&quantity=1"
 
 # Nome de cada plataforma de origem (vem no campo salePlatform)
 PLATAFORMAS = {1: "Taobao", 2: "Weidian", 3: "1688"}
@@ -313,7 +322,8 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
     return [
         {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "tamanho": l[3],
          "imagem": l[4], "link": l[5], "preco": l[6], "categoria": l[7],
-         "plataforma": l[8], "origem": l[9]}
+         "plataforma": l[8], "origem": l[9],
+         "compra": URL_COMPRA.format(id=l[0])}
         for l in cursor.fetchall()
     ]
 
@@ -489,7 +499,8 @@ def montar_item(registro: dict) -> Optional[dict]:
         "titulo_pt": "",                                    # preenchido depois
         "tamanho": tamanho,
         "imagem": imagem,
-        "link": URL_PRODUTO.format(id=produto_id),          # link de compra
+        "link": URL_PRODUTO.format(id=produto_id),          # pagina no CSSDeals
+        "compra": URL_COMPRA.format(id=produto_id),         # direto pro carrinho
         "preco": preco,
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
         "plataforma": PLATAFORMAS.get(registro.get("salePlatform"), ""),
@@ -883,7 +894,10 @@ def montar_texto_telegram(item: dict) -> str:
     if item.get("link"):
         linhas.append("")
         linhas.append("—" * 18)
-        linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
+        atalhos = ['<a href="{}">Ver no CSSDeals</a>'.format(item["link"])]
+        if item.get("compra"):
+            atalhos.append('🛒 <a href="{}"><b>COMPRE AQUI</b></a>'.format(item["compra"]))
+        linhas.append("   ·   ".join(atalhos))
 
     return "\n".join(linhas)
 
@@ -1028,6 +1042,9 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     etiquetas = [e for e in (item.get("categoria"), item.get("plataforma")) if e]
     if etiquetas:
         detalhes.append(" · ".join(etiquetas))
+    if item.get("compra"):
+        detalhes.append("[🛒 **COMPRE AQUI**]({})  ·  [Ver no CSSDeals]({})".format(
+            item["compra"], item.get("link", "")))
     if detalhes:
         embed["description"] = "\n".join(detalhes)
 
@@ -1463,6 +1480,7 @@ def testar_notificacao(config: dict) -> bool:
         "titulo": "Teste do bot — se voce esta lendo isso, funcionou!",
         "titulo_pt": "",
         "tamanho": "",
+        "compra": "",
         "imagem": "",
         "link": "",
         "preco": "",

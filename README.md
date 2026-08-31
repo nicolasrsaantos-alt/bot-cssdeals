@@ -55,9 +55,22 @@ Hat&Bags · Taobao
 Preço: CN¥ 57,50
 
 ——————————————————
-Ver no CSSDeals    ← link clicável
+Ver no CSSDeals  ·  🛒 COMPRE AQUI
 [foto do produto]
 ```
+
+**"COMPRE AQUI" joga o produto direto no carrinho do CSSBuy.** O cliente
+pula os passos de abrir o produto, clicar em Buy Now e Copy Link.
+
+> **Como funciona:** o botão Buy Now do CSSDeals faz um
+> `POST /api/cart {productId, quantity}` e recebe de volta um `redirectUrl`.
+> Esse endereço depende só do id do produto no CSSDeals — que o bot já tem —,
+> então ele é montado direto, sem requisição extra:
+>
+> `https://www.cssbuy.com/waiting?type=cssdeals&productId={id}&quantity=1`
+>
+> Verificado: em 5 de 5 produtos o link gerado é **idêntico** ao que a
+> API do próprio site devolve.
 
 **O tamanho aparece logo abaixo do nome.** Se o produto não tiver tamanho
 cadastrado (serviços, kits, eletrônicos), a linha simplesmente não aparece —
