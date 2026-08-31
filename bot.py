@@ -134,6 +134,36 @@ URL_COMPRA = "https://www.cssbuy.com/waiting?type=cssdeals&productId={id}&quanti
 # Nome de cada plataforma de origem (vem no campo salePlatform)
 PLATAFORMAS = {1: "Taobao", 2: "Weidian", 3: "1688"}
 
+# --- Canais por grupo de categoria ---
+#
+# Cada grupo vira um canal do Discord. Voce so precisa criar o webhook e
+# colar na variavel correspondente no Railway (ex: CANAL_CALCADOS).
+# Nao precisa digitar numero de categoria — o mapa ja esta pronto aqui.
+#
+# Produto de categoria que nao esta em nenhum grupo cai em OUTROS.
+GRUPOS = {
+    "CALCADOS":    ["11"],
+    "ROUPAS":      ["14", "15", "32", "12", "35", "33", "34", "31", "40", "18"],
+    "ACESSORIOS":  ["26", "27", "30", "39", "44", "45", "16", "41"],
+    "ELETRONICOS": ["20", "21", "22", "38", "23", "24", "19"],
+    "OUTROS":      ["36", "37", "43"],
+}
+
+# Nome bonito de cada grupo, para os logs
+NOME_GRUPO = {
+    "CALCADOS": "Calcados", "ROUPAS": "Roupas", "ACESSORIOS": "Acessorios",
+    "ELETRONICOS": "Eletronicos", "OUTROS": "Outros",
+}
+
+
+def grupo_do_produto(categoria_id: str) -> str:
+    """Descobre em qual grupo/canal o produto se encaixa."""
+    for grupo, categorias in GRUPOS.items():
+        if str(categoria_id) in categorias:
+            return grupo
+    return "OUTROS"
+
+
 # Categorias do site — usado so para mostrar o nome na mensagem.
 # (levantado de https://cssdeals.com/api/category/tree)
 CATEGORIAS = {
@@ -503,6 +533,7 @@ def montar_item(registro: dict) -> Optional[dict]:
         "compra": URL_COMPRA.format(id=produto_id),         # direto pro carrinho
         "preco": preco,
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
+        "grupo": grupo_do_produto(registro.get("categoryId") or ""),
         "plataforma": PLATAFORMAS.get(registro.get("salePlatform"), ""),
         "origem": str(registro.get("sourceLink") or "").strip(),
     }
@@ -1105,8 +1136,15 @@ def notificar(item: dict, config: dict) -> bool:
         if enviar_telegram(item, config["telegram_token"], config["telegram_chat_id"]):
             enviou_algum = True
 
+    # Canal geral: recebe tudo, se estiver configurado
     if config["discord_webhook"]:
         if enviar_discord(item, config["discord_webhook"]):
+            enviou_algum = True
+
+    # Canal do grupo do produto (calcados, roupas, ...)
+    canal = config.get("canais", {}).get(item.get("grupo", ""))
+    if canal:
+        if enviar_discord(item, canal):
             enviou_algum = True
 
     return enviou_algum
@@ -1141,6 +1179,9 @@ def carregar_config() -> dict:
         "telegram_token": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
         "telegram_chat_id": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         "discord_webhook": os.getenv("DISCORD_WEBHOOK_URL", "").strip(),
+        # Um webhook por grupo de categoria (CANAL_CALCADOS, CANAL_ROUPAS...)
+        "canais": {g: os.getenv("CANAL_" + g, "").strip()
+                   for g in GRUPOS if os.getenv("CANAL_" + g, "").strip()},
         # Vazio = monitora lancamentos de TODAS as abas do site.
         # Preenchido = so daquela aba (ex: 11 para Shoes, 32 para Hoodie).
         "categoria": os.getenv("CATEGORIA_ID", "").strip(),
@@ -1164,7 +1205,7 @@ def carregar_config() -> dict:
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
-    tem_discord = bool(config["discord_webhook"])
+    tem_discord = bool(config["discord_webhook"]) or bool(config["canais"])
 
     if not tem_telegram and not tem_discord:
         log.error(
@@ -1180,7 +1221,9 @@ def carregar_config() -> dict:
     if tem_telegram:
         canais.append("Telegram")
     if tem_discord:
-        canais.append("Discord")
+        canais.append("Discord (canal geral)")
+    for g in config["canais"]:
+        canais.append("Discord/" + NOME_GRUPO.get(g, g))
     log.info("Canais ativos: %s", " + ".join(canais))
 
     if config["categoria"]:
@@ -1483,6 +1526,7 @@ def testar_notificacao(config: dict) -> bool:
         "titulo_pt": "",
         "tamanho": "",
         "compra": "",
+        "grupo": "OUTROS",
         "imagem": "",
         "link": "",
         "preco": "",

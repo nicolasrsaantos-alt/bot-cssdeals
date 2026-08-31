@@ -302,6 +302,34 @@ Ele avisa por e-mail; basta reativar na aba **Actions**.
 
 ---
 
+## Canais separados por categoria no Discord
+
+Dá para ter um canal por tipo de produto, além de um canal geral com tudo.
+Crie um webhook em cada canal e cole nas Variables do Railway:
+
+| Variável | Canal recebe |
+|---|---|
+| `DISCORD_WEBHOOK_URL` | **tudo** (canal geral) |
+| `CANAL_CALCADOS` | Shoes |
+| `CANAL_ROUPAS` | T-shirts, Pants, Hoodie, Coat, suit, socks... |
+| `CANAL_ACESSORIOS` | Hat&Bags, Belt&Glasses, perfume, suitcase... |
+| `CANAL_ELETRONICOS` | Watches, Cell phone, Earphone, phone case... |
+| `CANAL_OUTROS` | sports goods, toy e o que não se encaixar |
+
+Você não precisa digitar número de categoria — o mapa das 29 categorias do
+site já está pronto no `bot.py`. Preencha só os canais que quiser; os
+demais podem ficar em branco.
+
+Um mesmo produto vai para o canal geral **e** para o canal da categoria
+dele, se os dois estiverem configurados.
+
+> **Sobre o volume:** ele é bem desigual. Numa amostra de 40 lançamentos,
+> Roupas levou 28, Acessórios 9, Outros 2 e Calçados 1. Canal que quase
+> nunca recebe nada passa impressão de abandono — vale considerar juntar
+> os menores.
+
+---
+
 ## Quer receber só de uma aba?
 
 Por padrão você recebe lançamentos de **todas** as abas. Para receber só de
