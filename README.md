@@ -53,9 +53,10 @@ ignora o pedido e volta ao mínimo, sem erro nenhum. O máximo real é **100**.
 Tamanho: L
 Hat&Bags · Taobao
 Preço: CN¥ 57,50
-
 ——————————————————
-Ver no CSSDeals  ·  🛒 COMPRE AQUI
+  🛒 COMPRE AQUI
+——————————————————
+Ver no CSSDeals
 [foto do produto]
 ```
 

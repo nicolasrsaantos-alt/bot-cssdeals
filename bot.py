@@ -891,13 +891,15 @@ def montar_texto_telegram(item: dict) -> str:
 
     # Uma linha em branco e um tracejado separam o link do resto,
     # para ele nao competir com o preco pela atencao.
+    # O link de compra fica destacado entre duas linhas, sozinho —
+    # e a acao principal. O link do CSSDeals vem depois, secundario.
+    risco = "—" * 18
+    if item.get("compra"):
+        linhas.append(risco)
+        linhas.append('  🛒 <a href="{}"><b>COMPRE AQUI</b></a>'.format(item["compra"]))
     if item.get("link"):
-        linhas.append("")
-        linhas.append("—" * 18)
-        atalhos = ['<a href="{}">Ver no CSSDeals</a>'.format(item["link"])]
-        if item.get("compra"):
-            atalhos.append('🛒 <a href="{}"><b>COMPRE AQUI</b></a>'.format(item["compra"]))
-        linhas.append("   ·   ".join(atalhos))
+        linhas.append(risco)
+        linhas.append('<a href="{}">Ver no CSSDeals</a>'.format(item["link"]))
 
     return "\n".join(linhas)
 
