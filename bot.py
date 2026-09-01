@@ -92,6 +92,44 @@ PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 # nao e etico e sim pratico: site que bloqueia seu IP te deixa com
 # ZERO alertas, o que e muito pior que 2 minutos de atraso.
 VARREDURA_PADRAO_MIN = 2
+
+# --- Janela de pico ---
+# No horario em que o site despeja muitos itens de uma vez, o bot varre
+# com muito mais frequencia. Fora dela, volta ao ritmo normal.
+#
+# ATENCAO AO FUSO: o servidor roda em UTC. FUSO_HORAS=-3 faz o bot
+# raciocinar no horario de Brasilia, que e como voce pensa os horarios.
+PICO_INICIO_PADRAO = "22:00"
+PICO_FIM_PADRAO    = "07:30"
+PICO_SEGUNDOS_PADRAO = 15
+FUSO_PADRAO = -3
+
+
+def _hora_local(fuso: int):
+    """Hora atual no fuso configurado (o servidor roda em UTC)."""
+    from datetime import timedelta, timezone as tz
+    return datetime.now(tz(timedelta(hours=fuso)))
+
+
+def _para_minutos(texto: str, padrao: str) -> int:
+    """Converte '22:00' em minutos desde a meia-noite."""
+    try:
+        h, m = texto.split(":")
+        return int(h) * 60 + int(m)
+    except Exception:
+        h, m = padrao.split(":")
+        return int(h) * 60 + int(m)
+
+
+def em_horario_de_pico(config: dict) -> bool:
+    """Diz se agora estamos na janela de pico (ex: 22:00 as 07:30)."""
+    if not config.get("pico_segundos"):
+        return False
+    agora = _hora_local(config["fuso"])
+    minutos = agora.hour * 60 + agora.minute
+    ini, fim = config["pico_inicio"], config["pico_fim"]
+    # janela que atravessa a meia-noite
+    return (minutos >= ini or minutos < fim) if ini > fim else (ini <= minutos < fim)
 DELAY_ENTRE_PAGINAS = 1.0
 
 # Quantas paginas buscar ao mesmo tempo na varredura profunda.
@@ -118,6 +156,11 @@ API_DETALHE = SITE_BASE + "/api/product/{id}"
 # Qual foto do anuncio usar: 0 = primeira, 1 = segunda, e assim por diante.
 # Valor padrao; o real e lido do .env em carregar_config().
 FOTO_PADRAO = 0
+
+# O servidor de imagens do CSSDeals redimensiona pela propria URL.
+# A foto original tem ~3 MB; assim cai para ~80 KB. Isso importa porque
+# o Telegram BAIXA a imagem a cada envio — foto grande atrasa a entrega.
+REDIMENSIONA_FOTO = "?x-oss-process=image/resize,w_800/quality,Q_80"
 
 # Pagina do produto no CSSDeals
 URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
@@ -638,9 +681,9 @@ def buscar_foto(produto_id: str, sessao: Optional[requests.Session] = None) -> O
 
     # Pede a foto escolhida; se o produto tiver menos fotos que isso,
     # fica com a ultima que existe
-    if _foto_escolhida < len(enderecos):
-        return enderecos[_foto_escolhida]
-    return enderecos[-1]
+    escolhida = (enderecos[_foto_escolhida]
+                 if _foto_escolhida < len(enderecos) else enderecos[-1])
+    return escolhida + REDIMENSIONA_FOTO
 
 
 def aplicar_fotos(itens: list, conexao=None) -> None:
@@ -652,16 +695,21 @@ def aplicar_fotos(itens: list, conexao=None) -> None:
     if not itens:
         return
 
+    # Em paralelo: com 15 produtos isso cai de ~17s para ~2s, e esse
+    # tempo vinha ANTES da primeira mensagem sair.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        fotos = list(executor.map(lambda i: buscar_foto(i["id"]), itens))
+
     trocadas = 0
-    for item in itens:
-        foto = buscar_foto(item["id"])
+    for item, foto in zip(itens, fotos):
         if foto and foto != item.get("imagem"):
             item["imagem"] = foto
             trocadas += 1
             if conexao is not None:
                 conexao.execute("UPDATE itens SET imagem = ? WHERE id = ?",
                                 (foto, item["id"]))
-        time.sleep(0.4)   # educacao com o servidor
 
     if conexao is not None:
         conexao.commit()
@@ -1202,6 +1250,10 @@ def carregar_config() -> dict:
                         in ("sim", "yes", "1", "true"),
         # 0 = primeira foto do anuncio, 1 = segunda, e assim por diante
         "foto": _inteiro_do_ambiente("FOTO_DO_ANUNCIO", FOTO_PADRAO, minimo=0),
+        "pico_inicio": _para_minutos(os.getenv("PICO_INICIO", PICO_INICIO_PADRAO), PICO_INICIO_PADRAO),
+        "pico_fim": _para_minutos(os.getenv("PICO_FIM", PICO_FIM_PADRAO), PICO_FIM_PADRAO),
+        "pico_segundos": _inteiro_do_ambiente("PICO_SEGUNDOS", PICO_SEGUNDOS_PADRAO, minimo=10),
+        "fuso": int(os.getenv("FUSO_HORAS", str(FUSO_PADRAO)) or FUSO_PADRAO),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1237,8 +1289,16 @@ def carregar_config() -> dict:
     _foto_escolhida = config["foto"]
     log.info("Foto usada nos avisos: a %sa do anuncio.", _foto_escolhida + 1)
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
-    log.info("Varredura profunda a cada %s minuto(s) — e ela que define "
-             "o atraso dos avisos.", config["varredura_min"])
+    from datetime import timedelta as _td
+    def _hhmm(m): return "%02d:%02d" % (m // 60, m % 60)
+    log.info("Varredura profunda a cada %s min — e ela que define o atraso.",
+             config["varredura_min"])
+    log.info("HORARIO DE PICO %s as %s (fuso %+d): varredura a cada %ss.",
+             _hhmm(config["pico_inicio"]), _hhmm(config["pico_fim"]),
+             config["fuso"], config["pico_segundos"])
+    log.info("Agora sao %s no seu fuso — pico %sATIVO.",
+             _hora_local(config["fuso"]).strftime("%H:%M"),
+             "" if em_horario_de_pico(config) else "NAO ")
 
     if config["traduzir"]:
         log.info("Traducao dos titulos para portugues: LIGADA.")
@@ -1268,12 +1328,15 @@ def rodar_coleta(config: dict) -> None:
     primeira_vez = banco_vazio(conexao)
 
     # Passo 1: buscar os produtos mais recentes na API do site
-    paginas, profunda = paginas_desta_rodada(primeira_vez, config["varredura_min"])
+    pico = em_horario_de_pico(config)
+    espera = config["pico_segundos"] if pico else config["varredura_min"] * 60
+
+    paginas, profunda = paginas_desta_rodada(primeira_vez, espera)
     if profunda:
         log.info(
-            "Varredura PROFUNDA: lendo %s paginas (~%s produtos) para achar "
+            "Varredura PROFUNDA%s: lendo %s paginas (~%s produtos) para achar "
             "itens que ficaram visiveis agora mas foram criados ha dias.",
-            paginas, paginas * TAMANHO_PAGINA,
+            " (HORARIO DE PICO)" if pico else "", paginas, paginas * TAMANHO_PAGINA,
         )
 
     registros = buscar_lancamentos(sessao, config["categoria"], paginas)
@@ -1389,7 +1452,7 @@ def rodar_coleta(config: dict) -> None:
 _ultima_varredura = 0.0
 
 
-def paginas_desta_rodada(primeira_vez: bool, minutos: int = VARREDURA_PADRAO_MIN) -> tuple:
+def paginas_desta_rodada(primeira_vez: bool, segundos: int = VARREDURA_PADRAO_MIN * 60) -> tuple:
     """
     Decide se esta rodada le so o topo ou faz a varredura profunda.
 
@@ -1402,7 +1465,7 @@ def paginas_desta_rodada(primeira_vez: bool, minutos: int = VARREDURA_PADRAO_MIN
     global _ultima_varredura
 
     agora = time.time()
-    passou = (agora - _ultima_varredura) >= minutos * 60
+    passou = (agora - _ultima_varredura) >= segundos
 
     if primeira_vez or passou:
         _ultima_varredura = agora
@@ -1443,7 +1506,8 @@ def rodar_coleta_arquivo(config: dict) -> None:
     conjunto = set(ja_vistos)
     primeira_vez = not ja_vistos
 
-    paginas, profunda = paginas_desta_rodada(primeira_vez, config["varredura_min"])
+    espera = config["pico_segundos"] if em_horario_de_pico(config) else config["varredura_min"] * 60
+    paginas, profunda = paginas_desta_rodada(primeira_vez, espera)
     if profunda:
         log.info("Varredura PROFUNDA: lendo %s paginas (~%s produtos).",
                  paginas, paginas * TAMANHO_PAGINA)
@@ -2144,7 +2208,11 @@ def main() -> None:
                 # Blindagem final: nada derruba o loop
                 log.exception("Erro inesperado na rodada: %s", erro)
 
-            time.sleep(config["intervalo"])
+            # No pico o ciclo acompanha a varredura acelerada
+            if em_horario_de_pico(config):
+                time.sleep(min(config["intervalo"], config["pico_segundos"]))
+            else:
+                time.sleep(config["intervalo"])
     else:
         executar_rodada(config)
 
