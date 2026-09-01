@@ -32,8 +32,8 @@ nunca sobem.
 
 | Tipo de rodada | Frequência | Lê | Serve para |
 |---|---|---|---|
-| **Rasa** | a cada 60s | 100 produtos | pegar os recém-criados, rápido |
-| **Profunda** | a cada 20 min | 1.000 produtos (~3 dias) | achar os que ficaram visíveis agora |
+| **Rasa** | a cada 60s | 200 produtos | pegar os recém-criados, rápido |
+| **Profunda** | **a cada 45s** · 15s no pico | 1.000 produtos (~3 dias) | achar os que ficaram visíveis agora |
 
 A varredura profunda procura **qualquer ID que o bot ainda não conheça**,
 independentemente da posição na lista.

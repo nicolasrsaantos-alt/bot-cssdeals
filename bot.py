@@ -91,7 +91,12 @@ PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 # hora — ritmo defensavel. Descer para 1 min dobraria isso, e o risco
 # nao e etico e sim pratico: site que bloqueia seu IP te deixa com
 # ZERO alertas, o que e muito pior que 2 minutos de atraso.
-VARREDURA_PADRAO_MIN = 2
+# Segundos entre varreduras profundas, fora do horario de pico.
+#
+# Cada varredura sao 10 requisicoes ao site. A 45s isso da ~800 por
+# hora; no pico de 15s, ~2400. E um ritmo alto — se o site comecar a
+# recusar ou dar timeout, afrouxe este numero.
+VARREDURA_PADRAO_SEG = 45
 
 # --- Janela de pico ---
 # No horario em que o site despeja muitos itens de uma vez, o bot varre
@@ -1244,8 +1249,8 @@ def carregar_config() -> dict:
         # E o modo usado quando o bot roda hospedado (GitHub Actions).
         "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
-        "varredura_min": _inteiro_do_ambiente(
-            "MINUTOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_MIN, minimo=1),
+        "varredura_seg": _inteiro_do_ambiente(
+            "SEGUNDOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_SEG, minimo=10),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
                         in ("sim", "yes", "1", "true"),
         # 0 = primeira foto do anuncio, 1 = segunda, e assim por diante
@@ -1291,8 +1296,8 @@ def carregar_config() -> dict:
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
     from datetime import timedelta as _td
     def _hhmm(m): return "%02d:%02d" % (m // 60, m % 60)
-    log.info("Varredura profunda a cada %s min — e ela que define o atraso.",
-             config["varredura_min"])
+    log.info("Varredura profunda a cada %ss — e ela que define o atraso.",
+             config["varredura_seg"])
     log.info("HORARIO DE PICO %s as %s (fuso %+d): varredura a cada %ss.",
              _hhmm(config["pico_inicio"]), _hhmm(config["pico_fim"]),
              config["fuso"], config["pico_segundos"])
@@ -1329,7 +1334,7 @@ def rodar_coleta(config: dict) -> None:
 
     # Passo 1: buscar os produtos mais recentes na API do site
     pico = em_horario_de_pico(config)
-    espera = config["pico_segundos"] if pico else config["varredura_min"] * 60
+    espera = config["pico_segundos"] if pico else config["varredura_seg"]
 
     paginas, profunda = paginas_desta_rodada(primeira_vez, espera)
     if profunda:
@@ -1452,7 +1457,7 @@ def rodar_coleta(config: dict) -> None:
 _ultima_varredura = 0.0
 
 
-def paginas_desta_rodada(primeira_vez: bool, segundos: int = VARREDURA_PADRAO_MIN * 60) -> tuple:
+def paginas_desta_rodada(primeira_vez: bool, segundos: int = VARREDURA_PADRAO_SEG) -> tuple:
     """
     Decide se esta rodada le so o topo ou faz a varredura profunda.
 
@@ -1506,7 +1511,7 @@ def rodar_coleta_arquivo(config: dict) -> None:
     conjunto = set(ja_vistos)
     primeira_vez = not ja_vistos
 
-    espera = config["pico_segundos"] if em_horario_de_pico(config) else config["varredura_min"] * 60
+    espera = config["pico_segundos"] if em_horario_de_pico(config) else config["varredura_seg"]
     paginas, profunda = paginas_desta_rodada(primeira_vez, espera)
     if profunda:
         log.info("Varredura PROFUNDA: lendo %s paginas (~%s produtos).",
@@ -2208,11 +2213,12 @@ def main() -> None:
                 # Blindagem final: nada derruba o loop
                 log.exception("Erro inesperado na rodada: %s", erro)
 
-            # No pico o ciclo acompanha a varredura acelerada
+            # O ciclo acompanha a cadencia da varredura, que e quem
+            # de fato encontra os lancamentos.
             if em_horario_de_pico(config):
-                time.sleep(min(config["intervalo"], config["pico_segundos"]))
+                time.sleep(config["pico_segundos"])
             else:
-                time.sleep(config["intervalo"])
+                time.sleep(min(config["intervalo"], config["varredura_seg"]))
     else:
         executar_rodada(config)
 
