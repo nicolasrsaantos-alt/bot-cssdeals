@@ -179,6 +179,18 @@ URL_PRODUTO = SITE_BASE + "/product-detail.html?itemid={id}"
 # mesmo, sem requisicao nenhuma.
 URL_COMPRA = "https://www.cssbuy.com/waiting?type=cssdeals&productId={id}&quantity=1"
 
+# Trecho extra colado no fim do link de compra — serve para o seu codigo
+# de indicacao do CSSBuy, que gera comissao quando alguem compra.
+#
+# Configure em CSSBUY_EXTRA no Railway, com o parametro exatamente como
+# aparece no SEU link de indicacao. Exemplos:
+#     &promotecode=SEUCODIGO
+#     &invitecode=SEUCODIGO
+#     &ref=SEUCODIGO
+#
+# Deixe vazio para nao acrescentar nada.
+_extra_compra = ""
+
 # Nome de cada plataforma de origem (vem no campo salePlatform)
 PLATAFORMAS = {1: "Taobao", 2: "Weidian", 3: "1688"}
 
@@ -401,7 +413,7 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
         {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "tamanho": l[3],
          "imagem": l[4], "link": l[5], "preco": l[6], "categoria": l[7],
          "plataforma": l[8], "origem": l[9],
-         "compra": URL_COMPRA.format(id=l[0])}
+         "compra": URL_COMPRA.format(id=l[0]) + _extra_compra}
         for l in cursor.fetchall()
     ]
 
@@ -578,7 +590,7 @@ def montar_item(registro: dict) -> Optional[dict]:
         "tamanho": tamanho,
         "imagem": imagem,
         "link": URL_PRODUTO.format(id=produto_id),          # pagina no CSSDeals
-        "compra": URL_COMPRA.format(id=produto_id),         # direto pro carrinho
+        "compra": URL_COMPRA.format(id=produto_id) + _extra_compra,
         "preco": preco,
         "categoria": CATEGORIAS.get(str(registro.get("categoryId") or ""), ""),
         "grupo": grupo_do_produto(registro.get("categoryId") or ""),
@@ -1259,6 +1271,7 @@ def carregar_config() -> dict:
         "pico_fim": _para_minutos(os.getenv("PICO_FIM", PICO_FIM_PADRAO), PICO_FIM_PADRAO),
         "pico_segundos": _inteiro_do_ambiente("PICO_SEGUNDOS", PICO_SEGUNDOS_PADRAO, minimo=10),
         "fuso": int(os.getenv("FUSO_HORAS", str(FUSO_PADRAO)) or FUSO_PADRAO),
+        "cssbuy_extra": os.getenv("CSSBUY_EXTRA", "").strip(),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1289,9 +1302,19 @@ def carregar_config() -> dict:
     else:
         log.info("Monitorando lancamentos de TODAS as abas do site.")
 
-    global _mostrar_real, _foto_escolhida
+    global _mostrar_real, _foto_escolhida, _extra_compra
     _mostrar_real = config["mostrar_real"]
     _foto_escolhida = config["foto"]
+
+    # Garante que comece com & ou ?, para nao grudar no parametro anterior
+    extra = config["cssbuy_extra"]
+    if extra and not extra.startswith(("&", "?")):
+        extra = "&" + extra
+    _extra_compra = extra
+    if extra:
+        log.info("Codigo de indicacao do CSSBuy ativo nos links de compra.")
+    else:
+        log.info("Sem codigo de indicacao — links de compra sem comissao.")
     log.info("Foto usada nos avisos: a %sa do anuncio.", _foto_escolhida + 1)
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
     from datetime import timedelta as _td
