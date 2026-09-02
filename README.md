@@ -247,6 +247,30 @@ GitHub (*Settings → Secrets*) e só é injetado na hora que o bot roda.
 
 ---
 
+## Produtos esgotados não são anunciados
+
+A maioria dos produtos do CSSDeals tem **uma única unidade** — o campo
+`quantity` vem `1` na maior parte deles. Por isso esgotam em minutos.
+
+O bot confere o estoque em dois momentos:
+
+1. **Ao ler** — produto que já está com `quantity: 0` nem entra na fila
+2. **Antes de enviar** — reconfere, porque uma leva grande leva dezenas
+   de segundos para sair e dá tempo de esgotar na espera
+
+A segunda conferência não custa requisição extra: aproveita a mesma
+chamada que busca a foto do anúncio.
+
+> **Medido em 500 produtos:** 4% estavam esgotados, e **21 dos 22 estavam
+> entre os 100 mais recentes** — ou seja, esgotam logo depois de publicados,
+> que é exatamente quando o bot avisaria.
+
+Se a consulta de estoque falhar por problema de rede, o item é enviado
+mesmo assim — melhor avisar de um item que talvez tenha acabado do que
+deixar de avisar por causa de uma consulta que não respondeu.
+
+---
+
 ## Como ele evita te avisar duas vezes do mesmo item
 
 Cada produto do CSSDeals tem um número de identificação próprio. O bot guarda

@@ -583,11 +583,21 @@ def montar_item(registro: dict) -> Optional[dict]:
     # (servicos, kits) — nesses casos a linha nao aparece na mensagem.
     tamanho = str(primeiro_sku.get("size") or "").strip()
 
+    # Quantidade em estoque. A maioria dos produtos tem UMA unidade so —
+    # por isso eles esgotam em minutos, e por isso avisar de um item ja
+    # vendido gera reclamacao. Desconhecido conta como disponivel, para
+    # nao deixar de avisar por falta de dado.
+    try:
+        estoque = int(primeiro_sku.get("quantity"))
+    except (TypeError, ValueError):
+        estoque = None
+
     return {
         "id": produto_id,                                   # id do proprio site
         "titulo": titulo,
         "titulo_pt": "",                                    # preenchido depois
         "tamanho": tamanho,
+        "estoque": estoque,
         "imagem": imagem,
         "link": URL_PRODUTO.format(id=produto_id),          # pagina no CSSDeals
         "compra": URL_COMPRA.format(id=produto_id) + _extra_compra,
@@ -600,12 +610,25 @@ def montar_item(registro: dict) -> Optional[dict]:
 
 
 def extrair_itens(registros: list) -> list:
-    """Converte a lista crua da API em itens, descartando os invalidos."""
+    """
+    Converte a lista crua da API em itens.
+
+    Descarta os invalidos e os ja ESGOTADOS — nao adianta avisar de
+    produto sem estoque, so gera clique em link morto.
+    """
     itens = []
+    esgotados = 0
     for registro in registros:
         item = montar_item(registro)
-        if item:
-            itens.append(item)
+        if not item:
+            continue
+        if item.get("estoque") == 0:
+            esgotados += 1
+            continue
+        itens.append(item)
+
+    if esgotados:
+        log.info("Ignorados %s produto(s) ja esgotados.", esgotados)
     return itens
 
 
@@ -670,6 +693,19 @@ def salvar_estado(caminho: str, ids: list) -> None:
 #  1000 da varredura profunda.
 # ==========================================================================
 
+def buscar_detalhe(produto_id: str) -> Optional[dict]:
+    """Busca o detalhe do produto (fotos + estoque atual) numa so chamada."""
+    try:
+        resposta = requests.get(API_DETALHE.format(id=produto_id),
+                                headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except Exception as erro:
+        log.warning("Nao consegui o detalhe de %s (%s).", produto_id, str(erro)[:60])
+        return None
+    return (corpo.get("data") or {}) if corpo.get("code") == 0 else None
+
+
 def buscar_foto(produto_id: str, sessao: Optional[requests.Session] = None) -> Optional[str]:
     """
     Pega a foto do anuncio no CSSDeals (a segunda, por padrao).
@@ -703,35 +739,65 @@ def buscar_foto(produto_id: str, sessao: Optional[requests.Session] = None) -> O
     return escolhida + REDIMENSIONA_FOTO
 
 
-def aplicar_fotos(itens: list, conexao=None) -> None:
+def aplicar_fotos(itens: list, conexao=None) -> list:
     """
-    Troca a imagem dos itens pela foto do anuncio no CSSDeals.
+    Busca a foto do anuncio E reconfere o estoque, numa chamada so.
 
-    Chamado logo antes de avisar, so nos itens que vao ser enviados.
+    Devolve apenas os itens AINDA DISPONIVEIS. Uma leva grande leva
+    dezenas de segundos para ser enviada, e a maioria dos produtos tem
+    uma unidade — entao da tempo de esgotar enquanto esperam na fila.
+    Avisar de item vendido e o que mais gera reclamacao.
     """
     if not itens:
-        return
+        return itens
 
-    # Em paralelo: com 15 produtos isso cai de ~17s para ~2s, e esse
-    # tempo vinha ANTES da primeira mensagem sair.
     from concurrent.futures import ThreadPoolExecutor
-
     with ThreadPoolExecutor(max_workers=6) as executor:
-        fotos = list(executor.map(lambda i: buscar_foto(i["id"]), itens))
+        detalhes = list(executor.map(lambda i: buscar_detalhe(i["id"]), itens))
 
-    trocadas = 0
-    for item, foto in zip(itens, fotos):
-        if foto and foto != item.get("imagem"):
-            item["imagem"] = foto
-            trocadas += 1
+    disponiveis, trocadas, vendidos = [], 0, 0
+
+    for item, detalhe in zip(itens, detalhes):
+        # Sem detalhe (falha de rede): mantem o item, para nao deixar de
+        # avisar por causa de uma consulta que nao respondeu.
+        if detalhe is None:
+            disponiveis.append(item)
+            continue
+
+        skus = detalhe.get("skus") or []
+        primeiro = skus[0] if skus else {}
+        try:
+            estoque = int(primeiro.get("quantity"))
+        except (TypeError, ValueError):
+            estoque = None
+
+        if estoque == 0:
+            vendidos += 1
             if conexao is not None:
-                conexao.execute("UPDATE itens SET imagem = ? WHERE id = ?",
-                                (foto, item["id"]))
+                # Marca como avisado para nao tentar de novo na proxima rodada
+                marcar_notificado(conexao, item["id"])
+            continue
+
+        fotos = [f.get("url") for f in (detalhe.get("images") or []) if f.get("url")]
+        if fotos:
+            escolhida = (fotos[_foto_escolhida] if _foto_escolhida < len(fotos)
+                         else fotos[-1]) + REDIMENSIONA_FOTO
+            if escolhida != item.get("imagem"):
+                item["imagem"] = escolhida
+                trocadas += 1
+                if conexao is not None:
+                    conexao.execute("UPDATE itens SET imagem = ? WHERE id = ?",
+                                    (escolhida, item["id"]))
+        disponiveis.append(item)
 
     if conexao is not None:
         conexao.commit()
     if trocadas:
         log.info("Foto do anuncio do CSSDeals aplicada em %s item(ns).", trocadas)
+    if vendidos:
+        log.info("%s item(ns) esgotaram enquanto esperavam na fila — nao avisados.",
+                 vendidos)
+    return disponiveis
 
 
 # ==========================================================================
@@ -1455,7 +1521,7 @@ def rodar_coleta(config: dict) -> None:
                 len(pendentes), MAX_NOTIFICACOES_POR_RODADA,
             )
 
-        aplicar_fotos(a_enviar, conexao)
+        a_enviar = aplicar_fotos(a_enviar, conexao)
 
         for numero, item in enumerate(a_enviar, 1):
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
@@ -1590,7 +1656,7 @@ def rodar_coleta_arquivo(config: dict) -> None:
         for item in a_enviar:
             item["titulo_pt"] = traduzir(item["titulo"], None, config["traducao_email"])
 
-    aplicar_fotos(a_enviar)
+    a_enviar = aplicar_fotos(a_enviar)
 
     erros = 0
     for numero, item in enumerate(a_enviar, 1):
