@@ -1704,6 +1704,80 @@ def testar_notificacao(config: dict) -> bool:
 
 
 # ==========================================================================
+#  8.4 BUSCAR UM PRODUTO E RECUPERAR AS FOTOS
+# ==========================================================================
+#  As imagens do CSSDeals continuam no ar mesmo depois do anuncio sair
+#  do catalogo — some a listagem, nao os arquivos. Entao, se der para
+#  achar o produto, da para recuperar as fotos.
+#
+#  A busca so enxerga o que ainda esta no catalogo. Produto ja retirado
+#  nao aparece — para esses, so serve o endereco salvo antes.
+# ==========================================================================
+
+def buscar_por_titulo(termo: str, quantos: int = 10) -> list:
+    """Procura produtos cujo titulo contenha o termo."""
+    parametros = {
+        "fields": 1, "categoryId": "", "page": 1, "pageSize": quantos,
+        "priceMin": "0.00", "priceMax": "99999.00", "title": termo,
+    }
+    try:
+        resposta = requests.get(API_PRODUTOS, params=parametros,
+                                headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+        resposta.raise_for_status()
+        corpo = resposta.json()
+    except Exception as erro:
+        log.error("Busca falhou: %s", erro)
+        return []
+    if corpo.get("code") != 0:
+        log.error("A API recusou a busca: %s", corpo.get("msg"))
+        return []
+    return (corpo.get("data") or {}).get("records") or []
+
+
+def comando_buscar(termo: str) -> None:
+    """Mostra os produtos encontrados com TODAS as fotos de cada um."""
+    print()
+    print("=" * 66)
+    print("  BUSCA: {}".format(termo))
+    print("=" * 66)
+
+    achados = buscar_por_titulo(termo)
+    if not achados:
+        print()
+        print("  Nenhum produto encontrado com esse texto no titulo.")
+        print()
+        print("  A busca so enxerga o catalogo atual. Se o anuncio ja saiu")
+        print("  do ar, ele nao aparece aqui — nesse caso as fotos so podem")
+        print("  ser recuperadas por um endereco salvo antes.")
+        print()
+        print("  Tente um trecho menor do titulo, ou uma palavra so.")
+        return
+
+    for numero, registro in enumerate(achados, 1):
+        detalhe = buscar_detalhe(registro["id"]) or {}
+        fotos = [f.get("url") for f in (detalhe.get("images") or []) if f.get("url")]
+        sku = (detalhe.get("skus") or registro.get("skus") or [{}])[0]
+
+        print()
+        print("  {}. {}".format(numero, (registro.get("title") or "")[:60]))
+        print("     CN¥ {}   tamanho {}   estoque {}".format(
+            sku.get("price"), sku.get("size") or "-", sku.get("quantity")))
+        print("     {}".format(URL_PRODUTO.format(id=registro["id"])))
+        if fotos:
+            print("     FOTOS ({}):".format(len(fotos)))
+            for foto in fotos:
+                print("       {}".format(foto))
+        else:
+            print("     (sem fotos no catalogo)")
+
+    print()
+    print("=" * 66)
+    print("  As imagens continuam acessiveis mesmo se o anuncio sair do ar.")
+    print("  Salve os enderecos acima se quiser guardar.")
+    print("=" * 66)
+
+
+# ==========================================================================
 #  8.5 ASSISTENTE DE CONFIGURACAO  (bot.py --configurar)
 # ==========================================================================
 #  Faz as perguntas no Terminal e escreve o .env sozinho, para voce nao
@@ -2264,6 +2338,10 @@ def main() -> None:
         help="Descobre por que o grupo do Telegram nao foi encontrado.",
     )
     leitor.add_argument(
+        "--buscar", metavar="TEXTO",
+        help="Procura um produto pelo titulo e mostra todas as fotos dele.",
+    )
+    leitor.add_argument(
         "--testar", action="store_true",
         help="So envia uma mensagem de teste e sai (nao coleta nada).",
     )
@@ -2271,6 +2349,10 @@ def main() -> None:
 
     # O assistente roda ANTES da checagem de configuracao — e justamente
     # ele que cria o .env que a checagem exige.
+    if argumentos.buscar:
+        comando_buscar(argumentos.buscar)
+        return
+
     if argumentos.configurar:
         assistente_configuracao()
         return

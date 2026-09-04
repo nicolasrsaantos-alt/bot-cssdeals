@@ -247,6 +247,26 @@ GitHub (*Settings → Secrets*) e só é injetado na hora que o bot roda.
 
 ---
 
+## Recuperar as fotos de um produto
+
+As imagens ficam no servidor do CSSDeals **mesmo depois do anúncio sair
+do catálogo** — some a listagem, não os arquivos. Testado com fotos de
+6 dias antes: o anúncio devolvia `404` e as imagens abriam normalmente.
+
+Para achar um produto e pegar todas as fotos dele:
+
+```bash
+cd /Users/nicolas/bot-coleta && .venv/bin/python bot.py --buscar "trapstar"
+```
+
+Mostra preço, tamanho, estoque, o link e **todas as fotos** de cada
+resultado. Funciona com qualquer trecho do título.
+
+> **Limite:** a busca só enxerga o catálogo atual. Anúncio que já saiu
+> do ar não aparece — para esses, só um endereço salvo antes recupera.
+
+---
+
 ## Produtos esgotados não são anunciados
 
 A maioria dos produtos do CSSDeals tem **uma única unidade** — o campo
