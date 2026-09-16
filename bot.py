@@ -292,12 +292,29 @@ USER_AGENT = "BotColetaPessoal/1.0 (uso pessoal; contato via Telegram)"
 #  3. LOG (mostra o progresso na tela e salva no arquivo bot.log)
 # ==========================================================================
 
+# Mensagens de erro de rede trazem o endereco chamado — e nele vai o token
+# do Telegram ou o segredo do webhook do Discord. Estes padroes apagam
+# isso de TODA linha de log, inclusive tracebacks.
+_SEGREDOS_NO_LOG = [
+    (re.compile(r"\d{6,12}:[A-Za-z0-9_-]{30,}"), "<TOKEN-OCULTO>"),
+    (re.compile(r"(discord(?:app)?\.com/api/webhooks/\d+/)[A-Za-z0-9_-]+"), r"\1<OCULTO>"),
+]
+
+
+class FormatoSemSegredos(logging.Formatter):
+    def format(self, record):
+        texto = super().format(record)
+        for padrao, troca in _SEGREDOS_NO_LOG:
+            texto = padrao.sub(troca, texto)
+        return texto
+
+
 def configurar_log() -> logging.Logger:
     logger = logging.getLogger("bot")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
 
-    formato = logging.Formatter(
+    formato = FormatoSemSegredos(
         "%(asctime)s | %(levelname)-7s | %(message)s", datefmt="%d/%m/%Y %H:%M:%S"
     )
 
@@ -1151,7 +1168,7 @@ def _post_telegram(url: str, dados: dict) -> bool:
     """
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
-            resposta = requests.post(url, data=dados, timeout=TIMEOUT)
+            resposta = requests.post(url, data=dados, timeout=(5, TIMEOUT))
 
             if resposta.status_code == 200:
                 return True
@@ -1247,7 +1264,7 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     for tentativa in range(1, MAX_TENTATIVAS + 1):
         try:
             resposta = requests.post(
-                webhook_url, json={"embeds": [embed]}, timeout=TIMEOUT
+                webhook_url, json={"embeds": [embed]}, timeout=(5, TIMEOUT)
             )
 
             if resposta.status_code in (200, 204):
@@ -2349,6 +2366,55 @@ def assistente_configuracao() -> None:
 #  9. PONTO DE ENTRADA
 # ==========================================================================
 
+def testar_rede() -> None:
+    """
+    Na partida, testa se ESTE servidor alcanca cada servico, por IPv4 e IPv6.
+
+    Existe porque a mensagem de erro engana: quando o IPv4 esgota o tempo
+    e o IPv6 nao tem rota, so aparece "Network is unreachable" (o ultimo
+    erro), escondendo que o IPv4 tambem falhou.
+
+    Se o IPv4 funciona e o IPv6 nao, forca todas as conexoes por IPv4.
+    """
+    import socket
+
+    def alcanca(host, familia):
+        try:
+            enderecos = socket.getaddrinfo(host, 443, familia, socket.SOCK_STREAM)
+        except socket.gaierror:
+            return "sem endereco"
+        motivo = "?"
+        for af, tipo, proto, _, destino in enderecos[:2]:
+            sock = socket.socket(af, tipo, proto)
+            sock.settimeout(5)
+            try:
+                sock.connect(destino)
+                return "OK"
+            except socket.timeout:
+                motivo = "sem resposta em 5s"
+            except OSError as erro:
+                motivo = erro.strerror or str(erro)
+            finally:
+                sock.close()
+        return "FALHOU (" + motivo + ")"
+
+    ipv4_telegram = "?"
+    for host in ("api.telegram.org", "discord.com", "cssdeals.com"):
+        v4 = alcanca(host, socket.AF_INET)
+        v6 = alcanca(host, socket.AF_INET6)
+        log.info("Rede ate %-16s IPv4: %-28s IPv6: %s", host, v4, v6)
+        if host == "api.telegram.org":
+            ipv4_telegram, ipv6_telegram = v4, v6
+
+    if ipv4_telegram == "OK" and ipv6_telegram != "OK":
+        import urllib3.util.connection as conexao_urllib3
+        conexao_urllib3.allowed_gai_family = lambda: socket.AF_INET
+        log.info("IPv6 indisponivel aqui — conexoes forcadas por IPv4.")
+    elif ipv4_telegram != "OK" and ipv6_telegram != "OK":
+        log.error("ESTE SERVIDOR NAO ALCANCA O TELEGRAM (nem IPv4 nem IPv6). "
+                  "O problema e a rede do servidor, nao o bot.")
+
+
 def main() -> None:
     leitor = argparse.ArgumentParser(
         description="Bot de coleta com notificacao no Telegram/Discord."
@@ -2398,6 +2464,7 @@ def main() -> None:
         return
 
     config = carregar_config()
+    testar_rede()
 
     if argumentos.testar:
         if not testar_notificacao(config):
