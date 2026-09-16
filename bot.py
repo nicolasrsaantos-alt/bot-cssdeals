@@ -449,25 +449,57 @@ def criar_sessao() -> requests.Session:
     return sessao
 
 
+# Guarda a leitura do robots.txt por um tempo, para nao buscar o arquivo
+# a cada rodada (no pico sao 4 rodadas por minuto).
+_robots_cache = {"leitor": None, "quando": 0.0}
+ROBOTS_VALIDADE = 3600   # segundos
+
+
 def robots_permite(url: str) -> bool:
     """
     Le o robots.txt do site e confere se o bot tem permissao de acessar.
 
-    E o equivalente a bater na porta antes de entrar. Se nao conseguir ler o
-    robots.txt, assume que pode (comportamento padrao da internet).
+    IMPORTANTE: o arquivo e buscado com a identificacao do PROPRIO bot.
+    O leitor padrao do Python usa "Python-urllib", que o Cloudflare do
+    cssdeals passou a bloquear (erro 1010) em 15/09/2026. O leitor
+    recebia 403 e, por regra antiga dele, tratava isso como "tudo
+    proibido" — o bot parou de enviar por horas sem o site ter proibido
+    nada.
+
+    Regras (RFC 9309):
+      - 200          -> obedece o que o arquivo diz
+      - 4xx          -> arquivo indisponivel = sem restricoes (com aviso)
+      - 5xx / rede   -> nao da para saber; segue com cautela (com aviso)
     """
-    try:
-        base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
+    agora = time.time()
+    base = "{}://{}".format(urlparse(url).scheme, urlparse(url).netloc)
+
+    if _robots_cache["leitor"] is None or agora - _robots_cache["quando"] > ROBOTS_VALIDADE:
         leitor = urllib.robotparser.RobotFileParser()
-        leitor.set_url(urljoin(base, "/robots.txt"))
-        leitor.read()
-        permitido = leitor.can_fetch(USER_AGENT, url)
-        if not permitido:
-            log.error("robots.txt do site PROIBE o acesso a %s — coleta cancelada.", url)
-        return permitido
-    except Exception as erro:
-        log.warning("Nao consegui ler o robots.txt (%s). Seguindo com cautela.", erro)
-        return True
+        try:
+            resposta = requests.get(urljoin(base, "/robots.txt"),
+                                    headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
+            if resposta.status_code == 200:
+                leitor.parse(resposta.text.splitlines())
+            elif 400 <= resposta.status_code < 500:
+                log.warning("robots.txt indisponivel (HTTP %s). Sem restricoes declaradas.",
+                            resposta.status_code)
+                leitor.parse([])
+            else:
+                log.warning("robots.txt respondeu HTTP %s. Seguindo com cautela.",
+                            resposta.status_code)
+                leitor.parse([])
+        except Exception as erro:
+            log.warning("Nao consegui ler o robots.txt (%s). Seguindo com cautela.",
+                        str(erro)[:80])
+            leitor.parse([])
+        _robots_cache["leitor"] = leitor
+        _robots_cache["quando"] = agora
+
+    permitido = _robots_cache["leitor"].can_fetch(USER_AGENT, url)
+    if not permitido:
+        log.error("robots.txt do site PROIBE o acesso a %s — coleta cancelada.", url)
+    return permitido
 
 
 def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
