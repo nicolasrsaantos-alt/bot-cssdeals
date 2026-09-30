@@ -355,16 +355,24 @@ def abrir_banco() -> sqlite3.Connection:
             plataforma    TEXT,
             origem        TEXT,
             visto_em      TEXT NOT NULL,      -- quando o bot viu pela 1a vez
-            notificado    INTEGER DEFAULT 0   -- 0 = ainda nao avisou, 1 = ja avisou
+            notificado    INTEGER DEFAULT 0,  -- 1 = TODOS os canais configurados receberam
+            grupo         TEXT,               -- calcados/roupas/... (para o canal certo do Discord)
+            tg_ok         INTEGER DEFAULT 0,  -- 1 = ja chegou no Telegram
+            discord_ok    INTEGER DEFAULT 0,  -- 1 = ja chegou no canal geral do Discord
+            canal_ok      INTEGER DEFAULT 0   -- 1 = ja chegou no canal da categoria (Discord)
         )
         """
     )
-    # Bancos criados antes desta versao nao tem a coluna 'tamanho'.
+    # Bancos criados antes desta versao nao tem estas colunas.
     # Adiciona sem apagar nada do que ja estava salvo.
     colunas = [c[1] for c in conexao.execute("PRAGMA table_info(itens)")]
-    if "tamanho" not in colunas:
-        conexao.execute("ALTER TABLE itens ADD COLUMN tamanho TEXT")
-        log.info("Banco atualizado: coluna 'tamanho' adicionada.")
+    for nome, tipo in (("tamanho", "TEXT"), ("grupo", "TEXT"),
+                       ("tg_ok", "INTEGER DEFAULT 0"),
+                       ("discord_ok", "INTEGER DEFAULT 0"),
+                       ("canal_ok", "INTEGER DEFAULT 0")):
+        if nome not in colunas:
+            conexao.execute(f"ALTER TABLE itens ADD COLUMN {nome} {tipo}")
+            log.info("Banco atualizado: coluna '%s' adicionada.", nome)
 
     conexao.commit()
     return conexao
@@ -391,12 +399,16 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
     `ja_notificado=True` e usado so na primeira rodada, para registrar o que
     ja existia no site sem te encher de mensagens.
     """
+    # Item que ja nasce sem estoque (esgotou na fila) entra direto como
+    # concluido nos 3 canais — nao ha o que reenviar.
+    tudo_ok = 1 if ja_notificado else 0
     conexao.execute(
         """
         INSERT OR IGNORE INTO itens
             (id, titulo, titulo_pt, tamanho, imagem, link, preco, categoria,
-             plataforma, origem, visto_em, notificado)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             plataforma, origem, visto_em, notificado, grupo,
+             tg_ok, discord_ok, canal_ok)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"], item["titulo"], item.get("titulo_pt", ""),
@@ -405,6 +417,8 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
             item["preco"], item["categoria"], item["plataforma"], item["origem"],
             datetime.now().isoformat(timespec="seconds"),
             1 if ja_notificado else 0,
+            item.get("grupo", "OUTROS"),
+            tudo_ok, tudo_ok, tudo_ok,
         ),
     )
     conexao.commit()
@@ -412,32 +426,104 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
 
 def buscar_pendentes(conexao: sqlite3.Connection) -> list:
     """
-    Devolve os itens que ja estao salvos mas que AINDA NAO foram avisados.
+    Devolve os itens que ainda faltam em ALGUM canal.
 
-    Por que isso existe: se o .env estiver errado na primeira vez que voce
-    rodar, os itens sao salvos mas a mensagem falha. Sem esta funcao, eles
-    ficariam presos no banco para sempre e voce nunca seria avisado deles.
-    Assim, assim que voce arrumar o .env, o bot manda os atrasados.
+    Por que isso existe: se o Telegram estiver fora do ar (ou o token
+    errado) mas o Discord funcionar, o item PRECISA continuar pendente
+    para o Telegram — nao pode ser dado como concluido so porque um dos
+    canais recebeu. Por isso cada canal tem sua propria coluna de status
+    (tg_ok, discord_ok, canal_ok), e so viram 'notificado=1' quando TODOS
+    os canais configurados no momento tiverem recebido.
     """
     cursor = conexao.execute(
         """
         SELECT id, titulo, titulo_pt, tamanho, imagem, link, preco,
-               categoria, plataforma, origem
+               categoria, plataforma, origem, grupo, tg_ok, discord_ok, canal_ok
         FROM itens WHERE notificado = 0 ORDER BY visto_em
         """
     )
     return [
         {"id": l[0], "titulo": l[1], "titulo_pt": l[2], "tamanho": l[3],
          "imagem": l[4], "link": l[5], "preco": l[6], "categoria": l[7],
-         "plataforma": l[8], "origem": l[9],
-         "compra": URL_COMPRA.format(id=l[0]) + _extra_compra}
+         "plataforma": l[8], "origem": l[9], "grupo": l[10] or "OUTROS",
+         "compra": URL_COMPRA.format(id=l[0]) + _extra_compra,
+         "_tg_ok": bool(l[11]), "_discord_ok": bool(l[12]), "_canal_ok": bool(l[13])}
         for l in cursor.fetchall()
     ]
 
 
 def marcar_notificado(conexao: sqlite3.Connection, item_id: str) -> None:
-    conexao.execute("UPDATE itens SET notificado = 1 WHERE id = ?", (item_id,))
+    """Marca o item como concluido em TODOS os canais (ex: ja esgotou)."""
+    conexao.execute(
+        "UPDATE itens SET notificado = 1, tg_ok = 1, discord_ok = 1, canal_ok = 1 "
+        "WHERE id = ?", (item_id,)
+    )
     conexao.commit()
+
+
+def enviar_por_canais(item: dict, config: dict) -> dict:
+    """
+    Manda o item so nos canais que AINDA nao o receberam.
+
+    Um item novo (recem extraido, nunca salvo) nao tem _tg_ok/_discord_ok/
+    _canal_ok — trata como False em todos, ou seja, tenta todos os canais
+    configurados. Um item retomado (vindo de buscar_pendentes) so tenta de
+    novo o que faltou da vez anterior — nao reenvia ao que ja funcionou.
+
+    Devolve o status ATUALIZADO de cada canal (True = confirmado entregue
+    agora ou em rodada anterior; False = ainda falta).
+    """
+    tg_ok = item.get("_tg_ok", False)
+    discord_ok = item.get("_discord_ok", False)
+    canal_ok = item.get("_canal_ok", False)
+
+    tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
+    tem_discord_geral = bool(config["discord_webhook"])
+    webhook_canal = config.get("canais", {}).get(item.get("grupo", ""))
+
+    if tem_telegram and not tg_ok:
+        tg_ok = enviar_telegram(item, config["telegram_token"], config["telegram_chat_id"])
+        if not tg_ok:
+            log.warning("Telegram NAO recebeu (vai tentar de novo na proxima rodada): %s",
+                       item["titulo"][:50])
+
+    if tem_discord_geral and not discord_ok:
+        discord_ok = enviar_discord(item, config["discord_webhook"])
+        if not discord_ok:
+            log.warning("Discord (canal geral) NAO recebeu (vai tentar de novo): %s",
+                       item["titulo"][:50])
+
+    if webhook_canal and not canal_ok:
+        canal_ok = enviar_discord(item, webhook_canal)
+        if not canal_ok:
+            log.warning("Discord/%s NAO recebeu (vai tentar de novo): %s",
+                       NOME_GRUPO.get(item.get("grupo", ""), item.get("grupo")),
+                       item["titulo"][:50])
+
+    # Canais que NAO estao configurados contam como "ok" — nao ha o que
+    # entregar ali, entao nao devem travar o item como pendente para sempre.
+    return {
+        "tg_ok": tg_ok or not tem_telegram,
+        "discord_ok": discord_ok or not tem_discord_geral,
+        "canal_ok": canal_ok or not webhook_canal,
+    }
+
+
+def salvar_status_canais(conexao: sqlite3.Connection, item_id: str, status: dict) -> bool:
+    """
+    Grava o status por canal. Devolve True se o item ficou COMPLETO
+    (todos os canais aplicaveis receberam) — nesse caso vira notificado=1
+    e nao aparece mais em buscar_pendentes.
+    """
+    completo = status["tg_ok"] and status["discord_ok"] and status["canal_ok"]
+    conexao.execute(
+        "UPDATE itens SET tg_ok = ?, discord_ok = ?, canal_ok = ?, notificado = ? "
+        "WHERE id = ?",
+        (int(status["tg_ok"]), int(status["discord_ok"]), int(status["canal_ok"]),
+         int(completo), item_id),
+    )
+    conexao.commit()
+    return completo
 
 
 # ==========================================================================
@@ -1574,9 +1660,9 @@ def rodar_coleta(config: dict) -> None:
 
         for numero, item in enumerate(a_enviar, 1):
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
-            if notificar(item, config):
-                marcar_notificado(conexao, item["id"])
-            else:
+            status = enviar_por_canais(item, config)
+            completo = salvar_status_canais(conexao, item["id"], status)
+            if not completo:
                 erros += 1
             # pausa para nao estourar o limite do Telegram (~1 msg/segundo)
             if numero < len(a_enviar):
