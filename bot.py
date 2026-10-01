@@ -97,7 +97,7 @@ PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 # Cada varredura sao 10 requisicoes ao site. A 45s isso da ~800 por
 # hora; no pico de 15s, ~2400. E um ritmo alto — se o site comecar a
 # recusar ou dar timeout, afrouxe este numero.
-VARREDURA_PADRAO_SEG = 10
+VARREDURA_PADRAO_SEG = 5
 
 # --- Janela de pico ---
 # No horario em que o site despeja muitos itens de uma vez, o bot varre
@@ -107,7 +107,7 @@ VARREDURA_PADRAO_SEG = 10
 # raciocinar no horario de Brasilia, que e como voce pensa os horarios.
 PICO_INICIO_PADRAO = "22:00"
 PICO_FIM_PADRAO    = "07:30"
-PICO_SEGUNDOS_PADRAO = 10
+PICO_SEGUNDOS_PADRAO = 5
 FUSO_PADRAO = -3
 
 
@@ -1690,30 +1690,93 @@ def rodar_coleta(config: dict) -> None:
 
         a_enviar = aplicar_fotos(a_enviar, conexao)
 
+        # ======================================================================
+        # Envio em DUAS VELOCIDADES.
+        #
+        # O Discord nao tem o limite de ~1 msg/segundo que o Telegram tem.
+        # Antes, os dois canais eram enviados juntos por item, numa fila so
+        # com pausa — isso fazia o Discord esperar a MESMA fila lenta do
+        # Telegram por nada: numa leva de 15 itens, o 15o chegava no Discord
+        # uns 18s depois do 1o, sem motivo nenhum, so por estar atras na fila.
+        #
+        # Agora: Discord sai em RAJADA, todos ao mesmo tempo (paralelo).
+        # Telegram continua em fila pausada, que e a unica coisa que
+        # realmente precisa disso.
+        # ======================================================================
+        from concurrent.futures import ThreadPoolExecutor
+
+        status_item = {
+            item["id"]: {"tg_ok": item.get("_tg_ok", False),
+                        "discord_ok": item.get("_discord_ok", False),
+                        "canal_ok": item.get("_canal_ok", False)}
+            for item in a_enviar
+        }
+
+        def _disparar_discord(item):
+            webhook_canal = config.get("canais", {}).get(item.get("grupo", ""))
+            tem_geral = bool(config["discord_webhook"])
+            discord_ok = status_item[item["id"]]["discord_ok"]
+            canal_ok = status_item[item["id"]]["canal_ok"]
+
+            if tem_geral and not discord_ok:
+                discord_ok = enviar_discord(item, config["discord_webhook"])
+                if not discord_ok:
+                    log.warning("Discord (canal geral) NAO recebeu (vai tentar de novo): %s",
+                               item["titulo"][:50])
+            if webhook_canal and not canal_ok:
+                canal_ok = enviar_discord(item, webhook_canal)
+                if not canal_ok:
+                    log.warning("Discord/%s NAO recebeu (vai tentar de novo): %s",
+                               NOME_GRUPO.get(item.get("grupo", ""), item.get("grupo")),
+                               item["titulo"][:50])
+            return item["id"], discord_ok or not tem_geral, canal_ok or not webhook_canal
+
+        if a_enviar:
+            log.info("Discord: disparando %s item(ns) em paralelo (sem fila).", len(a_enviar))
+            with ThreadPoolExecutor(max_workers=min(len(a_enviar), 10)) as executor:
+                for item_id, discord_ok, canal_ok in executor.map(_disparar_discord, a_enviar):
+                    status_item[item_id]["discord_ok"] = discord_ok
+                    status_item[item_id]["canal_ok"] = canal_ok
+
+        # Telegram: fila sequencial pausada, unica que de fato precisa disso.
+        # Reconfere o estoque RENTE a cada envio — como esta fila pode levar
+        # ate ~18s numa leva grande, e tempo de sobra para um produto de 1
+        # unidade (98% deles) esgotar entre a conferencia em lote (acima) e
+        # a vez de cada item aqui.
+        tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
+        fila_telegram = [item for item in a_enviar
+                         if tem_telegram and not status_item[item["id"]]["tg_ok"]]
+
         esgotaram_na_fila = 0
-        for numero, item in enumerate(a_enviar, 1):
-            # Reconfere o estoque RENTE ao envio. A conferencia em lote
-            # (aplicar_fotos, acima) pode ter sido feita ate ~18s atras
-            # para os ultimos itens da leva — tempo de sobra para um
-            # produto de 1 unidade (98% deles) esgotar nesse meio-tempo.
+        for numero, item in enumerate(fila_telegram, 1):
             disponivel = ainda_disponivel(item["id"])
             if disponivel is False:
                 esgotaram_na_fila += 1
-                marcar_notificado(conexao, item["id"])   # nao ha o que reenviar
-                log.info("Esgotou na fila, nao avisado: %s", item["titulo"][:60])
-                continue
-
-            log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
-            status = enviar_por_canais(item, config)
-            completo = salvar_status_canais(conexao, item["id"], status)
-            if not completo:
-                erros += 1
+                status_item[item["id"]]["tg_ok"] = True   # nada a reenviar aqui
+                log.info("Esgotou na fila do Telegram, nao avisado: %s", item["titulo"][:60])
+            else:
+                log.info("Avisando no Telegram %s/%s: %s",
+                         numero, len(fila_telegram), titulo_visivel(item)[:60])
+                ok = enviar_telegram(item, config["telegram_token"], config["telegram_chat_id"])
+                status_item[item["id"]]["tg_ok"] = ok
+                if not ok:
+                    log.warning("Telegram NAO recebeu (vai tentar de novo na proxima rodada): %s",
+                               item["titulo"][:50])
             # pausa para nao estourar o limite do Telegram (~1 msg/segundo)
-            if numero < len(a_enviar):
+            if numero < len(fila_telegram):
                 time.sleep(DELAY_ENTRE_MENSAGENS)
 
+        if not tem_telegram:
+            for item in a_enviar:
+                status_item[item["id"]]["tg_ok"] = True
+
+        for item in a_enviar:
+            completo = salvar_status_canais(conexao, item["id"], status_item[item["id"]])
+            if not completo:
+                erros += 1
+
         if esgotaram_na_fila:
-            log.info("%s item(ns) esgotaram DENTRO da fila de envio (entre a "
+            log.info("%s item(ns) esgotaram DENTRO da fila do Telegram (entre a "
                      "conferencia em lote e a vez de cada um).", esgotaram_na_fila)
 
     conexao.close()
