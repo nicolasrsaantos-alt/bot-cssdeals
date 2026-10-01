@@ -829,6 +829,32 @@ def salvar_estado(caminho: str, ids: list) -> None:
 #  1000 da varredura profunda.
 # ==========================================================================
 
+def ainda_disponivel(produto_id: str) -> Optional[bool]:
+    """
+    Confere o estoque NA HORA, rente ao envio.
+
+    Por que existe: aplicar_fotos confere o estoque de TODOS os itens de
+    uma vez, em paralelo (rapido). Mas o ENVIO e sequencial, com pausa
+    entre mensagens para nao estourar o limite do Telegram — numa leva
+    de 15 itens, o 15o e enviado ~18s depois do 1o. Como a maioria dos
+    produtos tem 1 unidade so, 18s e tempo de sobra para esgotar entre a
+    conferencia em lote e a entrega de verdade. Esta funcao reconfere
+    IMEDIATAMENTE antes de cada envio, fechando essa janela.
+
+    Devolve True (tem estoque), False (esgotado) ou None (nao deu para
+    confirmar — nesse caso o chamador deve enviar mesmo assim, para nao
+    perder o aviso por causa de uma consulta que falhou).
+    """
+    detalhe = buscar_detalhe(produto_id)
+    if detalhe is None:
+        return None
+    sku = (detalhe.get("skus") or [{}])[0]
+    try:
+        return int(sku.get("quantity")) != 0
+    except (TypeError, ValueError):
+        return None
+
+
 def buscar_detalhe(produto_id: str) -> Optional[dict]:
     """Busca o detalhe do produto (fotos + estoque atual) numa so chamada."""
     try:
@@ -1664,7 +1690,19 @@ def rodar_coleta(config: dict) -> None:
 
         a_enviar = aplicar_fotos(a_enviar, conexao)
 
+        esgotaram_na_fila = 0
         for numero, item in enumerate(a_enviar, 1):
+            # Reconfere o estoque RENTE ao envio. A conferencia em lote
+            # (aplicar_fotos, acima) pode ter sido feita ate ~18s atras
+            # para os ultimos itens da leva — tempo de sobra para um
+            # produto de 1 unidade (98% deles) esgotar nesse meio-tempo.
+            disponivel = ainda_disponivel(item["id"])
+            if disponivel is False:
+                esgotaram_na_fila += 1
+                marcar_notificado(conexao, item["id"])   # nao ha o que reenviar
+                log.info("Esgotou na fila, nao avisado: %s", item["titulo"][:60])
+                continue
+
             log.info("Avisando %s/%s: %s", numero, len(a_enviar), titulo_visivel(item)[:60])
             status = enviar_por_canais(item, config)
             completo = salvar_status_canais(conexao, item["id"], status)
@@ -1673,6 +1711,10 @@ def rodar_coleta(config: dict) -> None:
             # pausa para nao estourar o limite do Telegram (~1 msg/segundo)
             if numero < len(a_enviar):
                 time.sleep(DELAY_ENTRE_MENSAGENS)
+
+        if esgotaram_na_fila:
+            log.info("%s item(ns) esgotaram DENTRO da fila de envio (entre a "
+                     "conferencia em lote e a vez de cada um).", esgotaram_na_fila)
 
     conexao.close()
 
