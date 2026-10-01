@@ -17,6 +17,7 @@ from __future__ import annotations   # compatibilidade com Python 3.9
 
 import argparse
 import html
+import json
 import logging
 import os
 import re
@@ -1374,7 +1375,7 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
 
             log.warning(
                 "Discord devolveu erro %s (tentativa %s/%s): %s",
-                resposta.status_code, tentativa, MAX_TENTATIVAS, resposta.text[:200],
+                resposta.status_code, tentativa, MAX_TENTATIVAS, resposta.text[:500],
             )
             time.sleep(2 * tentativa)
 
@@ -1385,7 +1386,12 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
             )
             time.sleep(2 * tentativa)
 
+    # Ao desistir, grava o embed EXATO que foi recusado — sem isso, uma
+    # rejeicao de conteudo (Discord ser chato com algum campo) e
+    # impossivel de diagnosticar depois, porque o log normal so mostra
+    # o erro do Discord, nao o que o bot tentou mandar.
     log.error("Desisti de enviar esta mensagem no Discord apos %s tentativas.", MAX_TENTATIVAS)
+    log.error("Embed recusado (para diagnostico): %s", json.dumps(embed, ensure_ascii=False)[:800])
     return False
 
 
