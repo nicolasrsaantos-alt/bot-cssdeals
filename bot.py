@@ -96,7 +96,7 @@ PAGINAS_PROFUNDAS = 10        # 10 x 100 = 1000 produtos (~3 dias)
 # Cada varredura sao 10 requisicoes ao site. A 45s isso da ~800 por
 # hora; no pico de 15s, ~2400. E um ritmo alto — se o site comecar a
 # recusar ou dar timeout, afrouxe este numero.
-VARREDURA_PADRAO_SEG = 45
+VARREDURA_PADRAO_SEG = 10
 
 # --- Janela de pico ---
 # No horario em que o site despeja muitos itens de uma vez, o bot varre
@@ -106,7 +106,7 @@ VARREDURA_PADRAO_SEG = 45
 # raciocinar no horario de Brasilia, que e como voce pensa os horarios.
 PICO_INICIO_PADRAO = "22:00"
 PICO_FIM_PADRAO    = "07:30"
-PICO_SEGUNDOS_PADRAO = 15
+PICO_SEGUNDOS_PADRAO = 10
 FUSO_PADRAO = -3
 
 
@@ -141,7 +141,7 @@ DELAY_ENTRE_PAGINAS = 1.0
 # NAO aumenta o numero de requisicoes — apenas evita que uma espere a
 # outra. A varredura cai de ~25s para ~3s, e esse tempo saia do seu
 # atraso. 4 simultaneas e um meio-termo: rapido sem parecer ataque.
-PAGINAS_SIMULTANEAS = 4
+PAGINAS_SIMULTANEAS = 10
 
 # Paginas da leitura RAPIDA (a de cada ciclo).
 #
@@ -1463,14 +1463,14 @@ def carregar_config() -> dict:
         "arquivo_estado": os.getenv("ARQUIVO_ESTADO", "").strip(),
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
         "varredura_seg": _inteiro_do_ambiente(
-            "SEGUNDOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_SEG, minimo=10),
+            "SEGUNDOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_SEG, minimo=5),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
                         in ("sim", "yes", "1", "true"),
         # 0 = primeira foto do anuncio, 1 = segunda, e assim por diante
         "foto": _inteiro_do_ambiente("FOTO_DO_ANUNCIO", FOTO_PADRAO, minimo=0),
         "pico_inicio": _para_minutos(os.getenv("PICO_INICIO", PICO_INICIO_PADRAO), PICO_INICIO_PADRAO),
         "pico_fim": _para_minutos(os.getenv("PICO_FIM", PICO_FIM_PADRAO), PICO_FIM_PADRAO),
-        "pico_segundos": _inteiro_do_ambiente("PICO_SEGUNDOS", PICO_SEGUNDOS_PADRAO, minimo=10),
+        "pico_segundos": _inteiro_do_ambiente("PICO_SEGUNDOS", PICO_SEGUNDOS_PADRAO, minimo=5),
         "fuso": int(os.getenv("FUSO_HORAS", str(FUSO_PADRAO)) or FUSO_PADRAO),
         "cssbuy_extra": os.getenv("CSSBUY_EXTRA", "").strip(),
     }
