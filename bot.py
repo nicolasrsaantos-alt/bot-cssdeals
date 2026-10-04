@@ -25,7 +25,7 @@ import sqlite3
 import sys
 import time
 import urllib.robotparser
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
@@ -364,6 +364,9 @@ def abrir_banco() -> sqlite3.Connection:
         )
         """
     )
+    conexao.execute(
+        "CREATE TABLE IF NOT EXISTS meta (chave TEXT PRIMARY KEY, valor TEXT)"
+    )
     # Bancos criados antes desta versao nao tem estas colunas.
     # Adiciona sem apagar nada do que ja estava salvo.
     colunas = [c[1] for c in conexao.execute("PRAGMA table_info(itens)")]
@@ -423,6 +426,54 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
         ),
     )
     conexao.commit()
+
+
+def guardar_piso(conexao: sqlite3.Connection, ids: list) -> int:
+    """
+    Grava o MENOR id da janela de referencia (a da primeira rodada).
+
+    Ele separa lancamento de "produto antigo que so apareceu": o catalogo
+    encolhe quando itens vendem, e cada item removido la em cima empurra um
+    item antigo, de FORA da janela de 1000, para dentro dela. O bot nunca
+    tinha visto esse item e o anunciava como novo — mesmo ele tendo semanas.
+    Na pratica, em 04/10/2026 a janela cobria 32 dias (antes ~3).
+
+    Id MENOR que o piso = mais velho que tudo o que o bot viu na partida =
+    entrou por baixo. Nao e lancamento.
+    """
+    piso = min(int(i) for i in ids)
+    conexao.execute("INSERT OR REPLACE INTO meta (chave, valor) VALUES ('piso_id', ?)",
+                    (str(piso),))
+    conexao.commit()
+    return piso
+
+
+def obter_piso(conexao: sqlite3.Connection) -> int:
+    linha = conexao.execute("SELECT valor FROM meta WHERE chave = 'piso_id'").fetchone()
+    if linha:
+        return int(linha[0])
+    # Banco antigo, sem piso gravado: usa o menor id que ele ja conhece.
+    linha = conexao.execute("SELECT MIN(CAST(id AS INTEGER)) FROM itens").fetchone()
+    if linha and linha[0]:
+        return int(guardar_piso(conexao, [linha[0]]))
+    return 0
+
+
+# Quanto tempo um aviso pendente continua valendo. Passou disso, o produto
+# (que tem 1 unidade em 98% dos casos) ja foi vendido ou removido — avisar
+# so manda o cliente para uma pagina vazia. Sem este limite, um canal com
+# falha persistente fazia o item ser tentado para sempre, dias depois.
+VALIDADE_PENDENTE_MIN = int(os.getenv("VALIDADE_PENDENTE_MIN", "10") or 10)
+
+
+def expirar_pendentes(conexao: sqlite3.Connection) -> int:
+    """Desiste dos avisos pendentes velhos demais. Devolve quantos."""
+    limite = (datetime.now() - timedelta(minutes=VALIDADE_PENDENTE_MIN)).isoformat(timespec="seconds")
+    cursor = conexao.execute(
+        "UPDATE itens SET notificado = 1 WHERE notificado = 0 AND visto_em < ?", (limite,)
+    )
+    conexao.commit()
+    return cursor.rowcount
 
 
 def buscar_pendentes(conexao: sqlite3.Connection) -> list:
@@ -846,6 +897,8 @@ def ainda_disponivel(produto_id: str) -> Optional[bool]:
     perder o aviso por causa de uma consulta que falhou).
     """
     detalhe = buscar_detalhe(produto_id)
+    if detalhe is REMOVIDO:
+        return False          # saiu do catalogo: nao existe mais para comprar
     if detalhe is None:
         return None
     sku = (detalhe.get("skus") or [{}])[0]
@@ -855,8 +908,21 @@ def ainda_disponivel(produto_id: str) -> Optional[bool]:
         return None
 
 
-def buscar_detalhe(produto_id: str) -> Optional[dict]:
-    """Busca o detalhe do produto (fotos + estoque atual) numa so chamada."""
+# Devolvido por buscar_detalhe quando o site diz, DEFINITIVAMENTE, que o
+# produto nao existe mais ("The details of the specified product do not
+# exist", code 404). Nao e o mesmo que falha de rede (None): falha de rede
+# significa "nao sei", e o bot envia mesmo assim; REMOVIDO significa "sei
+# que acabou", e o bot NAO pode avisar — o cliente cairia numa pagina vazia.
+REMOVIDO = {"_removido": True}
+
+
+def buscar_detalhe(produto_id: str):
+    """
+    Busca o detalhe do produto (fotos + estoque atual) numa so chamada.
+
+    Devolve: dict com os dados | REMOVIDO (produto saiu do catalogo) |
+    None (nao deu para confirmar: rede, timeout, resposta estranha).
+    """
     try:
         resposta = requests.get(API_DETALHE.format(id=produto_id),
                                 headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT)
@@ -865,7 +931,12 @@ def buscar_detalhe(produto_id: str) -> Optional[dict]:
     except Exception as erro:
         log.warning("Nao consegui o detalhe de %s (%s).", produto_id, str(erro)[:60])
         return None
-    return (corpo.get("data") or {}) if corpo.get("code") == 0 else None
+    codigo = corpo.get("code")
+    if codigo == 0:
+        return corpo.get("data") or {}
+    if codigo == 404:
+        return REMOVIDO
+    return None
 
 
 def buscar_foto(produto_id: str, sessao: Optional[requests.Session] = None) -> Optional[str]:
@@ -920,6 +991,15 @@ def aplicar_fotos(itens: list, conexao=None) -> list:
     disponiveis, trocadas, vendidos = [], 0, 0
 
     for item, detalhe in zip(itens, detalhes):
+        # Produto REMOVIDO do catalogo: nao existe mais. Descarta e marca
+        # como concluido — antes, isso era confundido com falha de rede e o
+        # bot avisava de produto que o cliente nao conseguia abrir.
+        if detalhe is REMOVIDO:
+            vendidos += 1
+            if conexao is not None:
+                marcar_notificado(conexao, item["id"])
+            continue
+
         # Sem detalhe (falha de rede): mantem o item, para nao deixar de
         # avisar por causa de uma consulta que nao respondeu.
         if detalhe is None:
@@ -1626,6 +1706,10 @@ def rodar_coleta(config: dict) -> None:
     if primeira_vez:
         for item in itens:
             salvar_item(conexao, item, ja_notificado=True)
+        piso = guardar_piso(conexao, [i["id"] for i in itens])
+        log.info("Janela de referencia: produtos criados desde %s.",
+                 (EPOCH_ID + timedelta(milliseconds=piso >> 22)).astimezone(
+                     timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
         conexao.close()
         log.info(
             "PRIMEIRA RODADA: guardei %s produtos como ponto de partida, "
@@ -1638,13 +1722,24 @@ def rodar_coleta(config: dict) -> None:
         return
 
     # Passo 4: separar o que e realmente novo
+    piso = obter_piso(conexao)
     novos = []
+    deslizaram = 0
     for item in itens:
         if item_ja_existe(conexao, item["id"]):
+            continue
+        if piso and int(item["id"]) < piso:
+            # Mais velho que tudo o que o bot viu na partida: so entrou na
+            # janela porque o catalogo encolheu. NAO e lancamento.
+            salvar_item(conexao, item, ja_notificado=True)
+            deslizaram += 1
             continue
         salvar_item(conexao, item)      # salva na hora (incremental)
         novos.append(item)
 
+    if deslizaram:
+        log.info("Ignorados %s produto(s) ANTIGOS que entraram na janela por baixo "
+                 "(o catalogo encolheu) — nao sao lancamentos.", deslizaram)
     log.info("LANCAMENTOS NOVOS nesta rodada: %s", len(novos))
 
     # Passo 4.5: traduzir os titulos dos novos para portugues.
@@ -1672,6 +1767,10 @@ def rodar_coleta(config: dict) -> None:
     # Passo 5: notificar tudo que ainda nao foi avisado.
     # Inclui os novos de agora E qualquer atrasado de rodadas anteriores
     # (por exemplo, se o Discord estava fora do ar ou o .env estava errado).
+    vencidos = expirar_pendentes(conexao)
+    if vencidos:
+        log.info("Desisti de %s aviso(s) pendente(s) com mais de %s min — o produto "
+                 "ja deve ter vendido ou saido do ar.", vencidos, VALIDADE_PENDENTE_MIN)
     pendentes = buscar_pendentes(conexao)
     atrasados = len(pendentes) - len(novos)
     if atrasados > 0:
@@ -1787,6 +1886,10 @@ def rodar_coleta(config: dict) -> None:
         "erros de envio: %s", duracao, len(itens), len(novos), erros,
     )
 
+
+# Os ids dos produtos guardam o momento de criacao (conferido contra a data
+# das fotos em 791 de 796 produtos). Epoch: 01/01/2025 UTC.
+EPOCH_ID = datetime(2025, 1, 1, tzinfo=timezone.utc)
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
@@ -2000,7 +2103,9 @@ def comando_buscar(termo: str) -> None:
         return
 
     for numero, registro in enumerate(achados, 1):
-        detalhe = buscar_detalhe(registro["id"]) or {}
+        detalhe = buscar_detalhe(registro["id"])
+        if detalhe is None or detalhe is REMOVIDO:
+            detalhe = {}
         fotos = [f.get("url") for f in (detalhe.get("images") or []) if f.get("url")]
         sku = (detalhe.get("skus") or registro.get("skus") or [{}])[0]
 
