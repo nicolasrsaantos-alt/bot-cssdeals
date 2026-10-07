@@ -284,9 +284,16 @@ IDIOMA_DESTINO = "pt-BR"
 DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
 LIMITE_TEXTO_TRADUCAO = 480   # o MyMemory aceita ate ~500 caracteres por vez
 
-# User-Agent honesto: identifica o bot em vez de fingir ser um navegador.
-# Isso e boa pratica — o dono do site consegue ver quem esta acessando.
-USER_AGENT = "BotColetaPessoal/1.0 (uso pessoal; contato via Telegram)"
+# User-Agent honesto: diz o que o programa e, em vez de fingir ser um navegador.
+# O dono do site consegue ver quem esta acessando e para que.
+#
+# Historico: ate 06/10/2026 era "BotColetaPessoal/1.0". Em 07/10 o Cloudflare
+# do cssdeals passou a responder 403 "Just a moment..." a esse nome (user-agents
+# de navegador e curl passavam). Por decisao do usuario, o nome foi trocado por
+# outro que continua dizendo claramente que e um monitor automatico. NAO
+# imita navegador. Se este nome tambem for barrado, a saida e a autorizacao
+# do CSSBuy/CSSDeals (API oficial), nao disfarce.
+USER_AGENT = "ColetaPessoal/1.0 (monitor de lancamentos para uso pessoal)"
 
 
 # ==========================================================================
@@ -1647,6 +1654,8 @@ def carregar_config() -> dict:
         "pico_segundos": _inteiro_do_ambiente("PICO_SEGUNDOS", PICO_SEGUNDOS_PADRAO, minimo=5),
         "fuso": int(os.getenv("FUSO_HORAS", str(FUSO_PADRAO)) or FUSO_PADRAO),
         "cssbuy_extra": os.getenv("CSSBUY_EXTRA", "").strip(),
+        # Quantas horas para tras recuperar na PRIMEIRA rodada (0 = nenhuma).
+        "recuperar_horas": _inteiro_do_ambiente("RECUPERAR_HORAS", 0, minimo=0),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1769,8 +1778,27 @@ def rodar_coleta(config: dict) -> None:
     # Sem isso voce receberia 50 mensagens de uma vez logo de cara, de
     # produtos que ja estavam no site antes de voce ligar o bot.
     if primeira_vez:
+        # Reiniciar o bot (deploy, queda, bloqueio longo) apaga a memoria e a
+        # primeira rodada trata tudo o que existe como "ja visto" — ou seja,
+        # engole o que foi publicado enquanto ele estava fora. RECUPERAR_HORAS
+        # deixa os itens criados nas ultimas N horas na fila para serem
+        # anunciados (o estoque e reconferido antes de cada envio).
+        # Use so apos uma parada; depois apague a variavel, senao um deploy
+        # comum reanunciaria itens que ja tinham sido avisados.
+        corte = None
+        if config.get("recuperar_horas"):
+            corte = datetime.now(timezone.utc) - timedelta(hours=config["recuperar_horas"])
+            log.info("RECUPERACAO ativa: itens criados nas ultimas %s horas serao "
+                     "anunciados (se ainda tiverem estoque).", config["recuperar_horas"])
+        recuperados = 0
         for item in itens:
-            salvar_item(conexao, item, ja_notificado=True)
+            recente = corte is not None and (
+                EPOCH_ID + timedelta(milliseconds=int(item["id"]) >> 22)) >= corte
+            if recente:
+                recuperados += 1
+            salvar_item(conexao, item, ja_notificado=not recente)
+        if recuperados:
+            log.info("%s item(ns) recente(s) ficaram na fila para serem anunciados.", recuperados)
         piso = guardar_piso(conexao, [i["id"] for i in itens])
         log.info("Janela de referencia: produtos criados desde %s.",
                  (EPOCH_ID + timedelta(milliseconds=piso >> 22)).astimezone(

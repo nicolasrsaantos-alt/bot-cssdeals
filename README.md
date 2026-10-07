@@ -145,7 +145,8 @@ por trás — e ela tem **~10.000 produtos de verdade, atualizados diariamente**
 - ✅ **Não tem captcha nem bloqueio anti-bot.** O site passa por Cloudflare,
   mas testei: acesso simples responde normal. **Não precisa de Playwright nem
   de contornar proteção nenhuma.**
-- O bot se identifica honestamente como `BotColetaPessoal/1.0` em vez de
+- O bot se identifica honestamente como `ColetaPessoal/1.0 (monitor de
+  lançamentos para uso pessoal)` em vez de
   fingir ser um navegador.
 - **Nenhum dado pessoal é coletado** — só título, foto, preço e link.
 
