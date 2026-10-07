@@ -1655,7 +1655,10 @@ def carregar_config() -> dict:
         "fuso": int(os.getenv("FUSO_HORAS", str(FUSO_PADRAO)) or FUSO_PADRAO),
         "cssbuy_extra": os.getenv("CSSBUY_EXTRA", "").strip(),
         # Quantas horas para tras recuperar na PRIMEIRA rodada (0 = nenhuma).
-        "recuperar_horas": _inteiro_do_ambiente("RECUPERAR_HORAS", 0, minimo=0),
+        "recuperar_horas": _inteiro_do_ambiente(
+            "RECUPERAR_HORAS",
+            RECUPERACAO_UNICA_HORAS if datetime.now(timezone.utc) < RECUPERACAO_UNICA_ATE else 0,
+            minimo=0),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1986,6 +1989,15 @@ def rodar_coleta(config: dict) -> None:
 # relacao ao UTC real (item criado ha ~15 min decodificava como 2h46 no
 # futuro). O epoch efetivo e 31/12/2024 21:00 UTC.
 EPOCH_ID = datetime(2024, 12, 31, 21, 0, tzinfo=timezone.utc)
+
+# RECUPERACAO UNICA com prazo de validade, pedida em 07/10/2026: o bot ficou
+# cego (Cloudflare) e os itens publicados no dia (08:05 a 09:21, horario de
+# Brasilia) nao foram avisados. Quem inicia o bot ANTES deste instante
+# recupera os itens criados nas ultimas RECUPERACAO_UNICA_HORAS horas (os
+# que ainda tiverem estoque). Depois do prazo vira 0 sozinho — assim um
+# reinicio futuro nao reanuncia itens ja avisados. Pode ser apagado depois.
+RECUPERACAO_UNICA_ATE = datetime(2026, 10, 7, 13, 28, tzinfo=timezone.utc)
+RECUPERACAO_UNICA_HORAS = 3
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
