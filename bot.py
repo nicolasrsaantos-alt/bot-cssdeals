@@ -246,7 +246,10 @@ CATEGORIAS = {
 # ==========================================================================
 # (algumas podem ser ajustadas por variavel de ambiente, sem mexer no codigo)
 
-BANCO_DADOS = "dados.db"          # arquivo SQLite onde tudo fica salvo
+# Arquivo SQLite onde tudo fica salvo. No Railway o disco comum e apagado a
+# cada reinicio; com um Volume montado em /data, use CAMINHO_BANCO=/data/dados.db
+# e o bot passa a lembrar o que ja avisou mesmo depois de reiniciar.
+BANCO_DADOS = os.getenv("CAMINHO_BANCO", "").strip() or "dados.db"
 ARQUIVO_LOG = "bot.log"           # historico do que o bot fez
 # Segundos entre cada rodada no modo --loop (servidor sempre ligado).
 # 60s da o menor atraso possivel sem pesar no site: e 1 consulta por
@@ -256,6 +259,8 @@ INTERVALO_PADRAO = 60
 DELAY_ENTRE_REQUISICOES = 1.5     # segundos de pausa entre paginas do site
 DELAY_ENTRE_MENSAGENS = 1.2       # segundos entre mensagens (limite do Telegram)
 TIMEOUT = 30                      # segundos ate desistir de uma requisicao
+TIMEOUT_CATALOGO = 10             # idem, so para as paginas do catalogo (normalmente <1s)
+TELEGRAM_PAUSA_SEG = 60           # apos falhas seguidas, deixa o Telegram quieto por este tempo
 MAX_TENTATIVAS = 3                # quantas vezes tentar de novo se der erro
 MAX_NOTIFICACOES_POR_RODADA = 20  # trava de seguranca contra spam
 
@@ -348,6 +353,9 @@ log = configurar_log()
 
 def abrir_banco() -> sqlite3.Connection:
     """Abre (ou cria, na primeira vez) o arquivo dados.db."""
+    pasta = os.path.dirname(BANCO_DADOS)
+    if pasta:
+        os.makedirs(pasta, exist_ok=True)
     conexao = sqlite3.connect(BANCO_DADOS)
     conexao.execute(
         """
@@ -602,7 +610,7 @@ def criar_sessao() -> requests.Session:
     politica_retry = Retry(
         total=MAX_TENTATIVAS,
         backoff_factor=1,                      # espera 1s, 2s, 4s
-        status_forcelist=[429, 500, 502, 503, 504],
+        status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET", "HEAD"],
     )
     adaptador = HTTPAdapter(max_retries=politica_retry)
@@ -701,7 +709,7 @@ def registrar_bloqueio() -> None:
     if n == 0:
         log.error("=" * 60)
         log.error("O CLOUDFLARE DO CSSDEALS ESTA BARRANDO O BOT.")
-        log.error("   O site responde HTTP 403 'Just a moment...' a este bot.")
+        log.error("   O site responde HTTP 403 'Just a moment...' (ou 429) a este bot.")
         log.error("   Enquanto durar, o bot NAO le o catalogo e NAO avisa nada.")
         log.error("   Nao e erro de codigo: e o site recusando o cliente.")
         log.error("   O bot respeita o bloqueio: nao insiste, espera e sonda 1x.")
@@ -724,7 +732,9 @@ def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
         "pageSize": TAMANHO_PAGINA, "priceMin": "0.00", "priceMax": "99999.00",
     }
     try:
-        resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
+        resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT_CATALOGO)
+        if resposta.status_code == 429:
+            return numero, DESAFIO      # excesso de requisicoes: recua, nao insiste
         if resposta.status_code == 403 and (
             resposta.headers.get("cf-mitigated") == "challenge"
             or "Just a moment" in resposta.text[:800]
@@ -1540,6 +1550,18 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
                 time.sleep(espera + 1)
                 continue
 
+            # Conteudo recusado (ex.: foto com endereco invalido). Melhor avisar
+            # sem a foto do que nao avisar: tira a imagem e, se preciso, o link.
+            if resposta.status_code == 400:
+                log.warning("Discord recusou o conteudo (400): %s", resposta.text[:300])
+                if "image" in embed:
+                    embed.pop("image")
+                    continue
+                if "url" in embed:
+                    embed.pop("url")
+                    continue
+                break
+
             if resposta.status_code in (401, 403, 404):
                 log.error(
                     "DISCORD recusou (%s) -> a URL do webhook parece invalida "
@@ -1785,8 +1807,6 @@ def rodar_coleta(config: dict) -> None:
         conexao.close()
         return
 
-    time.sleep(DELAY_ENTRE_REQUISICOES)   # educacao com o servidor
-
     # Passo 2: converter para o formato do bot
     itens = extrair_itens(registros)
     log.info("Produtos lidos nesta rodada: %s", len(itens))
@@ -1989,7 +2009,22 @@ def rodar_coleta(config: dict) -> None:
                          if tem_telegram and not status_item[item["id"]]["tg_ok"]]
 
         esgotaram_na_fila = 0
+        falhas_seguidas = 0
+        if fila_telegram and time.time() < _telegram_pausa["ate"]:
+            log.warning("Telegram em pausa (falhou ha pouco): %s item(ns) esperam, "
+                        "o Discord segue normal.", len(fila_telegram))
+            fila_telegram = []
         for numero, item in enumerate(fila_telegram, 1):
+            if falhas_seguidas >= 2:
+                # O Telegram esta fora do ar ou lento. Cada tentativa custa ~30s;
+                # insistir aqui pararia a leitura do site e atrasaria TODOS os
+                # clientes (inclusive os do Discord). Desiste da fila desta
+                # rodada; os itens ficam pendentes (validos por alguns minutos).
+                _telegram_pausa["ate"] = time.time() + TELEGRAM_PAUSA_SEG
+                log.error("TELEGRAM FALHOU %s vezes seguidas — pausando o Telegram por %ss "
+                          "para nao atrasar o resto. %s item(ns) ficam pendentes.",
+                          falhas_seguidas, TELEGRAM_PAUSA_SEG, len(fila_telegram) - numero + 1)
+                break
             disponivel = ainda_disponivel(item["id"])
             if disponivel is False:
                 esgotaram_na_fila += 1
@@ -2000,6 +2035,7 @@ def rodar_coleta(config: dict) -> None:
                          numero, len(fila_telegram), titulo_visivel(item)[:60])
                 ok = enviar_telegram(item, config["telegram_token"], config["telegram_chat_id"])
                 status_item[item["id"]]["tg_ok"] = ok
+                falhas_seguidas = 0 if ok else falhas_seguidas + 1
                 if not ok:
                     log.warning("Telegram NAO recebeu (vai tentar de novo na proxima rodada): %s",
                                item["titulo"][:50])
@@ -2100,6 +2136,9 @@ ENVIO_MANUAL_IDS = (
     "234350880128036864", "234357828416237568", "234358136525615104",
     "234360890585313281", "234361686462885889",
 )
+
+# Pausa do Telegram depois de falhas seguidas (ver rodar_coleta)
+_telegram_pausa = {"ate": 0.0}
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
@@ -2997,10 +3036,13 @@ def main() -> None:
 
             # O ciclo acompanha a cadencia da varredura, que e quem
             # de fato encontra os lancamentos.
+            # (a pausa entre rodadas fica AQUI, depois dos avisos — antes ela
+            # atrasava todo aviso em 1,5s sem proteger o site de nada)
             if em_horario_de_pico(config):
-                time.sleep(config["pico_segundos"])
+                time.sleep(config["pico_segundos"] + DELAY_ENTRE_REQUISICOES)
             else:
-                time.sleep(min(config["intervalo"], config["varredura_seg"]))
+                time.sleep(min(config["intervalo"], config["varredura_seg"])
+                           + DELAY_ENTRE_REQUISICOES)
     else:
         executar_rodada(config)
 
