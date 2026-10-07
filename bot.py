@@ -674,6 +674,42 @@ def baixar_pagina(sessao: requests.Session, url: str) -> Optional[str]:
     return None
 
 
+# Devolvido por _buscar_pagina quando o Cloudflare responde com o desafio
+# "Just a moment..." (HTTP 403 + cabecalho cf-mitigated: challenge). Isso NAO
+# e erro de codigo nem de rede: e o site decidindo nao atender este cliente.
+DESAFIO = object()
+
+# Estado do bloqueio: quantas rodadas seguidas foram barradas e ate quando o
+# bot deve ficar quieto. Quando o site barra, insistir (10 requisicoes a cada
+# 5s) so piora — o bot recua, espera cada vez mais e sonda com UMA requisicao.
+_bloqueio = {"seguidos": 0, "ate": 0.0}
+ESPERAS_BLOQUEIO = [60, 120, 300, 600]   # segundos; trava em 10 min
+
+
+def registrar_bloqueio() -> None:
+    n = _bloqueio["seguidos"]
+    _bloqueio["seguidos"] = n + 1
+    espera = ESPERAS_BLOQUEIO[min(n, len(ESPERAS_BLOQUEIO) - 1)]
+    _bloqueio["ate"] = time.time() + espera
+    if n == 0:
+        log.error("=" * 60)
+        log.error("O CLOUDFLARE DO CSSDEALS ESTA BARRANDO O BOT.")
+        log.error("   O site responde HTTP 403 'Just a moment...' a este bot.")
+        log.error("   Enquanto durar, o bot NAO le o catalogo e NAO avisa nada.")
+        log.error("   Nao e erro de codigo: e o site recusando o cliente.")
+        log.error("   O bot respeita o bloqueio: nao insiste, espera e sonda 1x.")
+        log.error("=" * 60)
+    elif n % 10 == 0:
+        log.warning("Bloqueio do Cloudflare continua (%s tentativas). Proxima em %ss.", n + 1, espera)
+
+
+def limpar_bloqueio() -> None:
+    if _bloqueio["seguidos"]:
+        log.info("O site voltou a responder normalmente (bloqueio terminou).")
+    _bloqueio["seguidos"] = 0
+    _bloqueio["ate"] = 0.0
+
+
 def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
     """Busca UMA pagina. Devolve (numero, registros) ou (numero, None)."""
     parametros = {
@@ -682,6 +718,11 @@ def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
     }
     try:
         resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT)
+        if resposta.status_code == 403 and (
+            resposta.headers.get("cf-mitigated") == "challenge"
+            or "Just a moment" in resposta.text[:800]
+        ):
+            return numero, DESAFIO
         resposta.raise_for_status()
         corpo = resposta.json()
     except requests.exceptions.Timeout:
@@ -713,8 +754,24 @@ def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
     profunda, que busca as paginas EM PARALELO para nao somar espera ao
     seu atraso — sao as mesmas requisicoes, so que sem fila.
     """
+    # Em recuo (site barrando): nao faz nenhuma requisicao ate o prazo vencer.
+    if time.time() < _bloqueio["ate"]:
+        return None
+
+    # Saindo de um bloqueio: sonda com UMA pagina antes de soltar as 10.
+    if _bloqueio["seguidos"] and paginas > 1:
+        _, amostra = _buscar_pagina(sessao, categoria, 1)
+        if amostra is DESAFIO:
+            registrar_bloqueio()
+            return None
+
     if paginas <= 1:
         _, registros = _buscar_pagina(sessao, categoria, 1)
+        if registros is DESAFIO:
+            registrar_bloqueio()
+            return None
+        if registros is not None:
+            limpar_bloqueio()
         return registros
 
     from concurrent.futures import ThreadPoolExecutor
@@ -726,6 +783,11 @@ def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
         for tarefa in tarefas:
             numero, registros = tarefa.result()
             resultados[numero] = registros
+
+    if any(r is DESAFIO for r in resultados.values()):
+        registrar_bloqueio()
+        return None
+    limpar_bloqueio()
 
     # Remonta na ordem certa; para na primeira pagina que falhou ou
     # veio incompleta (fim do catalogo)
@@ -1655,6 +1717,9 @@ def carregar_config() -> dict:
 
 def rodar_coleta(config: dict) -> None:
     """Executa UMA rodada: pergunta os lancamentos, salva e avisa os novos."""
+    if time.time() < _bloqueio["ate"]:
+        return          # site barrando o bot: recua em silencio ate o prazo
+
     inicio = time.time()
     log.info("=" * 60)
     log.info("Procurando lancamentos novos em %s", SITE_BASE)
@@ -1889,7 +1954,10 @@ def rodar_coleta(config: dict) -> None:
 
 # Os ids dos produtos guardam o momento de criacao (conferido contra a data
 # das fotos em 791 de 796 produtos). Epoch: 01/01/2025 UTC.
-EPOCH_ID = datetime(2025, 1, 1, tzinfo=timezone.utc)
+# Descoberto em 07/10/2026: o relogio embutido nos ids esta 3h ADIANTADO em
+# relacao ao UTC real (item criado ha ~15 min decodificava como 2h46 no
+# futuro). O epoch efetivo e 31/12/2024 21:00 UTC.
+EPOCH_ID = datetime(2024, 12, 31, 21, 0, tzinfo=timezone.utc)
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
