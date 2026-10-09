@@ -498,7 +498,7 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
         """
         SELECT id, titulo, titulo_pt, tamanho, imagem, link, preco,
                categoria, plataforma, origem, grupo, tg_ok, discord_ok, canal_ok
-        FROM itens WHERE notificado = 0 ORDER BY visto_em
+        FROM itens WHERE notificado = 0 ORDER BY visto_em, rowid
         """
     )
     return [
@@ -1659,6 +1659,11 @@ def carregar_config() -> dict:
             "RECUPERAR_HORAS",
             RECUPERACAO_UNICA_HORAS if datetime.now(timezone.utc) < RECUPERACAO_UNICA_ATE else 0,
             minimo=0),
+        # Quantos dos produtos mais novos (com estoque) anunciar na primeira rodada.
+        "enviar_ultimos": _inteiro_do_ambiente(
+            "ENVIAR_ULTIMOS",
+            ENVIO_MANUAL_QTD if datetime.now(timezone.utc) < ENVIO_MANUAL_ATE else 0,
+            minimo=0),
     }
 
     tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
@@ -1727,6 +1732,23 @@ def carregar_config() -> dict:
 #  8. RODADA DE COLETA
 # ==========================================================================
 
+def escolher_para_envio_manual(itens: list, quantos: int) -> list:
+    """
+    Escolhe os `quantos` produtos mais novos que ainda existem e tem estoque.
+
+    Confere cada candidato no site (a lista pode estar alguns segundos atrasada
+    e a maioria dos produtos tem 1 unidade). Devolve do mais ANTIGO para o mais
+    novo, para o canal terminar com o mais recente embaixo.
+    """
+    escolhidos = []
+    for item in sorted(itens, key=lambda i: int(i["id"]), reverse=True):
+        if len(escolhidos) >= quantos:
+            break
+        if ainda_disponivel(item["id"]) is not False:    # None = nao deu para saber: mantem
+            escolhidos.append(item)
+    return escolhidos[::-1]
+
+
 def rodar_coleta(config: dict) -> None:
     """Executa UMA rodada: pergunta os lancamentos, salva e avisa os novos."""
     if time.time() < _bloqueio["ate"]:
@@ -1793,13 +1815,23 @@ def rodar_coleta(config: dict) -> None:
             corte = datetime.now(timezone.utc) - timedelta(hours=config["recuperar_horas"])
             log.info("RECUPERACAO ativa: itens criados nas ultimas %s horas serao "
                      "anunciados (se ainda tiverem estoque).", config["recuperar_horas"])
+        manuais = []
+        if config.get("enviar_ultimos"):
+            manuais = escolher_para_envio_manual(itens, config["enviar_ultimos"])
+            log.info("ENVIO MANUAL: %s produto(s) mais novos, com estoque, entram na fila.",
+                     len(manuais))
+        ids_manuais = {m["id"] for m in manuais}
         recuperados = 0
         for item in itens:
+            if item["id"] in ids_manuais:
+                continue                       # entra abaixo, na ordem certa
             recente = corte is not None and (
                 EPOCH_ID + timedelta(milliseconds=int(item["id"]) >> 22)) >= corte
             if recente:
                 recuperados += 1
             salvar_item(conexao, item, ja_notificado=not recente)
+        for item in manuais:                   # do mais antigo ao mais novo
+            salvar_item(conexao, item, ja_notificado=False)
         if recuperados:
             log.info("%s item(ns) recente(s) ficaram na fila para serem anunciados.", recuperados)
         piso = guardar_piso(conexao, [i["id"] for i in itens])
@@ -1998,6 +2030,14 @@ EPOCH_ID = datetime(2024, 12, 31, 21, 0, tzinfo=timezone.utc)
 # reinicio futuro nao reanuncia itens ja avisados. Pode ser apagado depois.
 RECUPERACAO_UNICA_ATE = datetime(2026, 10, 7, 13, 28, tzinfo=timezone.utc)
 RECUPERACAO_UNICA_HORAS = 3
+
+# ENVIO MANUAL UNICO, pedido em 09/10/2026: na primeira rodada, anuncia os N
+# produtos MAIS NOVOS que ainda tenham estoque (conferido um a um no site).
+# Vale so para quem iniciar o bot ate o instante abaixo — depois vira 0 sozinho,
+# entao um reinicio futuro nao reposta nada. Para repetir sem mexer no codigo,
+# use a variavel ENVIAR_ULTIMOS=5 no Railway (e apague depois).
+ENVIO_MANUAL_ATE = datetime(2026, 10, 9, 5, 3, tzinfo=timezone.utc)
+ENVIO_MANUAL_QTD = 5
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
