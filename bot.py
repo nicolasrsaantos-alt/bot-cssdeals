@@ -142,7 +142,16 @@ DELAY_ENTRE_PAGINAS = 1.0
 # NAO aumenta o numero de requisicoes — apenas evita que uma espere a
 # outra. A varredura cai de ~25s para ~3s, e esse tempo saia do seu
 # atraso. 4 simultaneas e um meio-termo: rapido sem parecer ataque.
-PAGINAS_SIMULTANEAS = 10
+PAGINAS_SIMULTANEAS = 4
+
+# De quanto em quanto tempo fazer a varredura PROFUNDA (10 paginas). Antes ela
+# rodava a CADA ciclo (~1,4 requisicao/s o dia todo, 10 conexoes novas de uma
+# vez) — o aumento de fluxo de 07/10 coincidiu com os erros de conexao diarios
+# (HTTPSConnectionPool: Max retries exceeded). A leitura rapida (2 paginas)
+# continua a cada ciclo e pega os lancamentos normais; a profunda so serve para
+# o produto que o site publica no MEIO da lista, e 20s de espera para ele e
+# pouco. Pode mudar com VARREDURA_PROFUNDA_SEG no Railway (minimo 5).
+VARREDURA_PROFUNDA_PADRAO_SEG = 20
 
 # Paginas da leitura RAPIDA (a de cada ciclo).
 #
@@ -597,6 +606,27 @@ def salvar_status_canais(conexao: sqlite3.Connection, item_id: str, status: dict
 #  5. COLETA — baixar a pagina e extrair os dados
 # ==========================================================================
 
+# A sessao e reaproveitada entre as rodadas (conexao HTTPS mantida aberta): antes,
+# cada rodada abria ate 10 conexoes novas com handshake TLS completo.
+_sessao_global = {"obj": None}
+
+
+def obter_sessao() -> requests.Session:
+    if _sessao_global["obj"] is None:
+        _sessao_global["obj"] = criar_sessao()
+    return _sessao_global["obj"]
+
+
+def descartar_sessao() -> None:
+    """Joga fora as conexoes guardadas (depois de uma falha, comeca limpo)."""
+    sessao, _sessao_global["obj"] = _sessao_global["obj"], None
+    if sessao is not None:
+        try:
+            sessao.close()
+        except Exception:
+            pass
+
+
 def criar_sessao() -> requests.Session:
     """
     Prepara o 'navegador' do bot com retry automatico.
@@ -607,13 +637,17 @@ def criar_sessao() -> requests.Session:
     sessao = requests.Session()
     sessao.headers.update({"User-Agent": USER_AGENT})
 
+    # Poucas tentativas aqui dentro: a rodada seguinte ja e a nova tentativa, e
+    # insistir 4x em 10 paginas ao mesmo tempo so aumenta a carga num site que
+    # ja esta nao respondendo.
     politica_retry = Retry(
-        total=MAX_TENTATIVAS,
-        backoff_factor=1,                      # espera 1s, 2s, 4s
+        total=2,
+        backoff_factor=0.5,
         status_forcelist=[500, 502, 503, 504],
         allowed_methods=["GET", "HEAD"],
     )
-    adaptador = HTTPAdapter(max_retries=politica_retry)
+    adaptador = HTTPAdapter(max_retries=politica_retry, pool_connections=2,
+                            pool_maxsize=PAGINAS_SIMULTANEAS + 2)
     sessao.mount("https://", adaptador)
     sessao.mount("http://", adaptador)
     return sessao
@@ -725,6 +759,53 @@ def limpar_bloqueio() -> None:
     _bloqueio["ate"] = 0.0
 
 
+# Falhas de conexao: o requests esconde o motivo real atras de "Max retries
+# exceeded" (e o log cortava a mensagem em 70 caracteres). Aqui guardamos a
+# CAUSA de cada pagina que falhou para o log mostrar um resumo claro.
+_causas_falha = []
+_falha_rede = {"seguidas": 0, "ate": 0.0}
+ESPERAS_FALHA_REDE = [5, 10, 20, 40, 60]   # segundos; trava em 1 min
+
+
+def _causa_curta(erro) -> str:
+    atual = erro
+    for _ in range(8):
+        proximo = None
+        if getattr(atual, "reason", None) is not None:           # urllib3 MaxRetryError
+            proximo = atual.reason
+        elif atual.args and isinstance(atual.args[0], BaseException):
+            proximo = atual.args[0]                              # requests embrulha o urllib3
+        elif atual.__cause__ is not None:
+            proximo = atual.__cause__
+        if proximo is None or proximo is atual:
+            break
+        atual = proximo
+    texto = re.sub(r"0x[0-9a-fA-F]+", "", str(atual))
+    return "%s: %s" % (type(atual).__name__, re.sub(r"\s+", " ", texto)[:110])
+
+
+def registrar_falha_rede(total_paginas: int) -> None:
+    n = _falha_rede["seguidas"]
+    _falha_rede["seguidas"] = n + 1
+    espera = ESPERAS_FALHA_REDE[min(n, len(ESPERAS_FALHA_REDE) - 1)]
+    _falha_rede["ate"] = time.time() + espera
+    contagem = {}
+    for causa in _causas_falha:
+        contagem[causa] = contagem.get(causa, 0) + 1
+    resumo = "; ".join("%sx %s" % (q, c) for c, q in sorted(contagem.items(), key=lambda x: -x[1])[:3])
+    log.error("SITE SEM RESPOSTA (%s falha(s) seguida(s)) — causa: %s. "
+              "Nova tentativa em %ss.", n + 1, resumo or "desconhecida", espera)
+    descartar_sessao()      # a proxima tentativa abre conexoes novas
+
+
+def limpar_falha_rede() -> None:
+    if _falha_rede["seguidas"]:
+        log.info("A conexao com o site voltou (depois de %s falha(s) seguida(s)).",
+                 _falha_rede["seguidas"])
+    _falha_rede["seguidas"] = 0
+    _falha_rede["ate"] = 0.0
+
+
 def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
     """Busca UMA pagina. Devolve (numero, registros) ou (numero, None)."""
     parametros = {
@@ -742,14 +823,8 @@ def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
             return numero, DESAFIO
         resposta.raise_for_status()
         corpo = resposta.json()
-    except requests.exceptions.Timeout:
-        log.error("Timeout na pagina %s.", numero)
-        return numero, None
-    except requests.exceptions.ConnectionError:
-        log.error("Conexao recusada na pagina %s.", numero)
-        return numero, None
     except Exception as erro:
-        log.error("Erro na pagina %s: %s", numero, str(erro)[:70])
+        _causas_falha.append(_causa_curta(erro))
         return numero, None
 
     if corpo.get("code") != 0:
@@ -771,9 +846,10 @@ def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
     profunda, que busca as paginas EM PARALELO para nao somar espera ao
     seu atraso — sao as mesmas requisicoes, so que sem fila.
     """
-    # Em recuo (site barrando): nao faz nenhuma requisicao ate o prazo vencer.
-    if time.time() < _bloqueio["ate"]:
+    # Em recuo (site barrando ou sem responder): nenhuma requisicao ate o prazo.
+    if time.time() < _bloqueio["ate"] or time.time() < _falha_rede["ate"]:
         return None
+    _causas_falha.clear()
 
     # Saindo de um bloqueio: sonda com UMA pagina antes de soltar as 10.
     if _bloqueio["seguidos"] and paginas > 1:
@@ -789,14 +865,26 @@ def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
             return None
         if registros is not None:
             limpar_bloqueio()
+            limpar_falha_rede()
+        else:
+            registrar_falha_rede(1)
         return registros
 
     from concurrent.futures import ThreadPoolExecutor
 
     resultados = {}
+    restantes = range(1, paginas + 1)
+    if paginas > 2:
+        # Varredura profunda: a pagina 1 vai SOZINHA primeiro, como sonda. Se o
+        # site nao responde, nao adianta disparar mais 9 pedidos (cada um
+        # esperaria o tempo limite inteiro) — e e justamente nessa hora que o
+        # site menos precisa de rajada.
+        _, primeira = _buscar_pagina(sessao, categoria, 1)
+        resultados[1] = primeira
+        restantes = range(2, paginas + 1) if isinstance(primeira, list) else range(0)
     with ThreadPoolExecutor(max_workers=PAGINAS_SIMULTANEAS) as executor:
         tarefas = [executor.submit(_buscar_pagina, sessao, categoria, n)
-                   for n in range(1, paginas + 1)]
+                   for n in restantes]
         for tarefa in tarefas:
             numero, registros = tarefa.result()
             resultados[numero] = registros
@@ -805,6 +893,14 @@ def buscar_lancamentos(sessao: requests.Session, categoria: str = "",
         registrar_bloqueio()
         return None
     limpar_bloqueio()
+    if resultados.get(1) is None:
+        registrar_falha_rede(paginas)         # nem a primeira pagina veio
+        return None
+    limpar_falha_rede()
+    falharam = sorted(n for n, r in resultados.items() if r is None)
+    if falharam:
+        log.warning("Paginas sem resposta nesta rodada: %s (%s). Leio o que veio.",
+                    falharam, "; ".join(sorted(set(_causas_falha))[:2]))
 
     # Remonta na ordem certa; para na primeira pagina que falhou ou
     # veio incompleta (fim do catalogo)
@@ -1667,6 +1763,8 @@ def carregar_config() -> dict:
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
         "varredura_seg": _inteiro_do_ambiente(
             "SEGUNDOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_SEG, minimo=5),
+        "profunda_seg": _inteiro_do_ambiente(
+            "VARREDURA_PROFUNDA_SEG", VARREDURA_PROFUNDA_PADRAO_SEG, minimo=5),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
                         in ("sim", "yes", "1", "true"),
         # 0 = primeira foto do anuncio, 1 = segunda, e assim por diante
@@ -1733,8 +1831,8 @@ def carregar_config() -> dict:
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
     from datetime import timedelta as _td
     def _hhmm(m): return "%02d:%02d" % (m // 60, m % 60)
-    log.info("Varredura profunda a cada %ss — e ela que define o atraso.",
-             config["varredura_seg"])
+    log.info("Leitura rapida a cada ~%ss; varredura profunda (10 paginas) a cada %ss.",
+             config["varredura_seg"], config["profunda_seg"])
     log.info("HORARIO DE PICO %s as %s (fuso %+d): varredura a cada %ss.",
              _hhmm(config["pico_inicio"]), _hhmm(config["pico_fim"]),
              config["fuso"], config["pico_segundos"])
@@ -1773,8 +1871,8 @@ def escolher_para_envio_manual(itens: list, quantos: int) -> list:
 
 def rodar_coleta(config: dict) -> None:
     """Executa UMA rodada: pergunta os lancamentos, salva e avisa os novos."""
-    if time.time() < _bloqueio["ate"]:
-        return          # site barrando o bot: recua em silencio ate o prazo
+    if time.time() < _bloqueio["ate"] or time.time() < _falha_rede["ate"]:
+        return          # site barrando/sem responder: recua em silencio ate o prazo
 
     inicio = time.time()
     log.info("=" * 60)
@@ -1786,14 +1884,12 @@ def rodar_coleta(config: dict) -> None:
 
     conexao = abrir_banco()
     criar_cache_traducao(conexao)
-    sessao = criar_sessao()
+    sessao = obter_sessao()
     primeira_vez = banco_vazio(conexao)
 
     # Passo 1: buscar os produtos mais recentes na API do site
     pico = em_horario_de_pico(config)
-    espera = config["pico_segundos"] if pico else config["varredura_seg"]
-
-    paginas, profunda = paginas_desta_rodada(primeira_vez, espera)
+    paginas, profunda = paginas_desta_rodada(primeira_vez, config["profunda_seg"])
     if profunda:
         log.info(
             "Varredura PROFUNDA%s: lendo %s paginas (~%s produtos) para achar "
@@ -1803,7 +1899,7 @@ def rodar_coleta(config: dict) -> None:
 
     registros = buscar_lancamentos(sessao, config["categoria"], paginas)
     if registros is None:
-        log.error("Rodada abortada: nao consegui falar com o site.")
+        log.warning("Rodada sem leitura do site (veja a causa acima).")
         conexao.close()
         return
 
@@ -2095,7 +2191,7 @@ ENVIO_MANUAL_QTD = 5
 # instante abaixo; o estoque e conferido de novo item a item antes de cada envio.
 # Ficam atras de qualquer lancamento novo na fila e valem por mais tempo que o
 # normal. Depois do prazo esta lista nao faz nada — pode ser apagada.
-ENVIO_MANUAL_IDS_ATE = datetime(2026, 10, 9, 10, 37, tzinfo=timezone.utc)
+ENVIO_MANUAL_IDS_ATE = datetime(2026, 10, 9, 10, 45, tzinfo=timezone.utc)
 ENVIO_MANUAL_IDS = (
     "233968388980142080", "233971051201359873", "234221982337789952",
     "234225254326923264", "234225585484001280", "234226232124043265",
@@ -2104,37 +2200,34 @@ ENVIO_MANUAL_IDS = (
     "234244116451749889", "234245249861742592", "234246003733360640",
     "234250460776951808", "234250711080431617", "234250812393844736",
     "234251045697810432", "234251343468228608", "234251556329156609",
-    "234252541613109248", "234254156864745473", "234254435202953217",
-    "234255607267651585", "234255844665257985", "234256332022411265",
-    "234256865999253505", "234256951768576001", "234258716798808064",
-    "234259001625604097", "234259544146243585", "234259927434326017",
-    "234261761074982912", "234262140302979072", "234263251105673216",
-    "234263427480350721", "234263707529834496", "234264294220689408",
-    "234264797444894720", "234265038994862081", "234265132729167873",
-    "234265203369635841", "234265279106183169", "234265397217783808",
-    "234265528453361665", "234265627870949376", "234266062757359617",
+    "234252532163342336", "234252541613109248", "234252925626806273",
+    "234254156864745473", "234254435202953217", "234255607267651585",
+    "234255844665257985", "234256332022411265", "234256865999253505",
+    "234256951768576001", "234258680597770240", "234258716798808064",
+    "234259001625604097", "234259495395848193", "234259544146243585",
+    "234259927434326017", "234259961118781440", "234261761074982912",
+    "234262070690115585", "234262140302979072", "234263251105673216",
+    "234264294220689408", "234264797444894720", "234265038994862081",
+    "234265203369635841", "234265397217783808", "234265627870949376",
     "234266386947698689", "234266469634207745", "234266547937669121",
-    "234266621317017601", "234266720881405953", "234266963907768320",
-    "234267081050484736", "234267165028839424", "234267376346263553",
-    "234267819185074177", "234269204609822720", "234270589464145920",
-    "234270601547935744", "234271231121354752", "234271527864168449",
-    "234272202228559872", "234272310986862592", "234272722871709696",
-    "234274683075489792", "234275487341670401", "234275733077553152",
-    "234275846583808000", "234276086275698688", "234276162809163776",
-    "234276576669528064", "234276847390879745", "234278329913765889",
-    "234278432623882240", "234278712312655872", "234279149845671936",
-    "234279186608746496", "234279303856320513", "234279710808666112",
-    "234279782829060097", "234279949590392833", "234280030280413185",
+    "234266963907768320", "234267081050484736", "234270601547935744",
+    "234271231121354752", "234271527864168449", "234272202228559872",
+    "234272310986862592", "234272722871709696", "234274683075489792",
+    "234275487341670401", "234275733077553152", "234275846583808000",
+    "234276086275698688", "234276162809163776", "234276576669528064",
+    "234276847390879745", "234278329913765889", "234278432623882240",
+    "234278712312655872", "234279149845671936", "234279303856320513",
+    "234279710808666112", "234279949590392833", "234280030280413185",
     "234280681592909824", "234280811133988864", "234281456809340929",
     "234281999984291840", "234282298341912577", "234282875524280320",
-    "234283061352919041", "234283220421898240", "234283687470231553",
-    "234283903564967937", "234316882836254721", "234317240887209985",
-    "234317481732534272", "234317661034835968", "234317755272458240",
-    "234318067483865088", "234318229333667840", "234318552961970176",
-    "234319140294553600", "234344180440428544", "234350147785781248",
-    "234350759847981057", "234350797236006912", "234350835408367616",
-    "234350880128036864", "234357828416237568", "234358136525615104",
-    "234360890585313281", "234361686462885889",
+    "234283220421898240", "234283687470231553", "234283903564967937",
+    "234316882836254721", "234317240887209985", "234317481732534272",
+    "234317661034835968", "234317755272458240", "234318067483865088",
+    "234318229333667840", "234318552961970176", "234319140294553600",
+    "234344180440428544", "234350147785781248", "234350759847981057",
+    "234350797236006912", "234350835408367616", "234350880128036864",
+    "234357828416237568", "234358136525615104", "234360890585313281",
+    "234361686462885889",
 )
 
 # Pausa do Telegram depois de falhas seguidas (ver rodar_coleta)
