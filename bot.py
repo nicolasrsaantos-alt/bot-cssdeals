@@ -400,7 +400,7 @@ def item_ja_existe(conexao: sqlite3.Connection, item_id: str) -> bool:
 
 
 def salvar_item(conexao: sqlite3.Connection, item: dict,
-                ja_notificado: bool = False) -> None:
+                ja_notificado: bool = False, visto_em: Optional[str] = None) -> None:
     """
     Salva UM item e grava no disco na hora (commit).
 
@@ -426,7 +426,7 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
             item.get("tamanho", ""),
             item["imagem"], item["link"],
             item["preco"], item["categoria"], item["plataforma"], item["origem"],
-            datetime.now().isoformat(timespec="seconds"),
+            visto_em or datetime.now().isoformat(timespec="seconds"),
             1 if ja_notificado else 0,
             item.get("grupo", "OUTROS"),
             tudo_ok, tudo_ok, tudo_ok,
@@ -1820,7 +1820,15 @@ def rodar_coleta(config: dict) -> None:
             manuais = escolher_para_envio_manual(itens, config["enviar_ultimos"])
             log.info("ENVIO MANUAL: %s produto(s) mais novos, com estoque, entram na fila.",
                      len(manuais))
-        ids_manuais = {m["id"] for m in manuais}
+        # Lista fixa do segundo envio manual (so dentro do prazo): do mais antigo ao
+        # mais novo, ATRAS dos lancamentos normais e com validade estendida.
+        fixos = []
+        if datetime.now(timezone.utc) < ENVIO_MANUAL_IDS_ATE:
+            lista = set(ENVIO_MANUAL_IDS)
+            fixos = sorted((i for i in itens if i["id"] in lista), key=lambda i: int(i["id"]))
+            log.info("ENVIO MANUAL (lista fixa): %s de %s produtos estao no catalogo com estoque.",
+                     len(fixos), len(lista))
+        ids_manuais = {m["id"] for m in manuais} | {f["id"] for f in fixos}
         recuperados = 0
         for item in itens:
             if item["id"] in ids_manuais:
@@ -1832,6 +1840,12 @@ def rodar_coleta(config: dict) -> None:
             salvar_item(conexao, item, ja_notificado=not recente)
         for item in manuais:                   # do mais antigo ao mais novo
             salvar_item(conexao, item, ja_notificado=False)
+        if fixos:
+            # visto_em no futuro: fica atras de qualquer item novo e nao expira
+            # antes de a fila inteira (limite do Telegram ~20/min) ser enviada.
+            atras = (datetime.now() + timedelta(minutes=30)).isoformat(timespec="seconds")
+            for item in fixos:
+                salvar_item(conexao, item, ja_notificado=False, visto_em=atras)
         if recuperados:
             log.info("%s item(ns) recente(s) ficaram na fila para serem anunciados.", recuperados)
         piso = guardar_piso(conexao, [i["id"] for i in itens])
@@ -2038,6 +2052,54 @@ RECUPERACAO_UNICA_HORAS = 3
 # use a variavel ENVIAR_ULTIMOS=5 no Railway (e apague depois).
 ENVIO_MANUAL_ATE = datetime(2026, 10, 9, 5, 3, tzinfo=timezone.utc)
 ENVIO_MANUAL_QTD = 5
+
+# SEGUNDO ENVIO MANUAL (09/10/2026, ~07:15 de Brasilia): produtos que apareceram
+# no site depois das 01:39 e nao foram avisados (113, comparados com o catalogo
+# daquela hora). Entram na fila na primeira rodada de quem iniciar o bot ate o
+# instante abaixo; o estoque e conferido de novo item a item antes de cada envio.
+# Ficam atras de qualquer lancamento novo na fila e valem por mais tempo que o
+# normal. Depois do prazo esta lista nao faz nada — pode ser apagada.
+ENVIO_MANUAL_IDS_ATE = datetime(2026, 10, 9, 10, 37, tzinfo=timezone.utc)
+ENVIO_MANUAL_IDS = (
+    "233968388980142080", "233971051201359873", "234221982337789952",
+    "234225254326923264", "234225585484001280", "234226232124043265",
+    "234230766028255232", "234231884569440256", "234232633177206785",
+    "234234991214915585", "234241800327720960", "234242473752588288",
+    "234244116451749889", "234245249861742592", "234246003733360640",
+    "234250460776951808", "234250711080431617", "234250812393844736",
+    "234251045697810432", "234251343468228608", "234251556329156609",
+    "234252541613109248", "234254156864745473", "234254435202953217",
+    "234255607267651585", "234255844665257985", "234256332022411265",
+    "234256865999253505", "234256951768576001", "234258716798808064",
+    "234259001625604097", "234259544146243585", "234259927434326017",
+    "234261761074982912", "234262140302979072", "234263251105673216",
+    "234263427480350721", "234263707529834496", "234264294220689408",
+    "234264797444894720", "234265038994862081", "234265132729167873",
+    "234265203369635841", "234265279106183169", "234265397217783808",
+    "234265528453361665", "234265627870949376", "234266062757359617",
+    "234266386947698689", "234266469634207745", "234266547937669121",
+    "234266621317017601", "234266720881405953", "234266963907768320",
+    "234267081050484736", "234267165028839424", "234267376346263553",
+    "234267819185074177", "234269204609822720", "234270589464145920",
+    "234270601547935744", "234271231121354752", "234271527864168449",
+    "234272202228559872", "234272310986862592", "234272722871709696",
+    "234274683075489792", "234275487341670401", "234275733077553152",
+    "234275846583808000", "234276086275698688", "234276162809163776",
+    "234276576669528064", "234276847390879745", "234278329913765889",
+    "234278432623882240", "234278712312655872", "234279149845671936",
+    "234279186608746496", "234279303856320513", "234279710808666112",
+    "234279782829060097", "234279949590392833", "234280030280413185",
+    "234280681592909824", "234280811133988864", "234281456809340929",
+    "234281999984291840", "234282298341912577", "234282875524280320",
+    "234283061352919041", "234283220421898240", "234283687470231553",
+    "234283903564967937", "234316882836254721", "234317240887209985",
+    "234317481732534272", "234317661034835968", "234317755272458240",
+    "234318067483865088", "234318229333667840", "234318552961970176",
+    "234319140294553600", "234344180440428544", "234350147785781248",
+    "234350759847981057", "234350797236006912", "234350835408367616",
+    "234350880128036864", "234357828416237568", "234358136525615104",
+    "234360890585313281", "234361686462885889",
+)
 
 # Momento da ultima varredura profunda (0 = nunca fez)
 _ultima_varredura = 0.0
