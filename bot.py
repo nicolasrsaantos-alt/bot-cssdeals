@@ -23,6 +23,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import urllib.robotparser
 from datetime import datetime, timedelta, timezone
@@ -1597,6 +1598,28 @@ def _post_telegram(url: str, dados: dict) -> bool:
     return False
 
 
+# Cada webhook do Discord aceita ~5 mensagens a cada 2 segundos (30 por minuto).
+# O envio em rajada paralelo (ate 10 itens ao mesmo tempo no MESMO webhook)
+# estourava esse limite numa leva grande: o Discord respondia 429 e o bot desistia
+# do item depois de 3 tentativas ("Discord NAO recebeu"). Agora cada webhook tem
+# uma fila propria com um intervalo minimo entre mensagens; webhooks diferentes
+# (canal geral x canal da categoria) continuam em paralelo.
+INTERVALO_WEBHOOK = 0.5
+_webhook_guarda = threading.Lock()
+_webhook_trava = {}
+_webhook_ultimo = {}
+
+
+def _esperar_vez_do_webhook(url: str) -> None:
+    with _webhook_guarda:
+        trava = _webhook_trava.setdefault(url, threading.Lock())
+    with trava:
+        falta = _webhook_ultimo.get(url, 0.0) + INTERVALO_WEBHOOK - time.time()
+        if falta > 0:
+            time.sleep(falta)
+        _webhook_ultimo[url] = time.time()
+
+
 def enviar_discord(item: dict, webhook_url: str) -> bool:
     """
     Envia UM item para o canal do Discord usando um Webhook.
@@ -1629,8 +1652,12 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     if detalhes:
         embed["description"] = "\n".join(detalhes)
 
-    for tentativa in range(1, MAX_TENTATIVAS + 1):
+    tentativa = 0
+    limitados = 0
+    while tentativa < MAX_TENTATIVAS:
+        tentativa += 1
         try:
+            _esperar_vez_do_webhook(webhook_url)
             resposta = requests.post(
                 webhook_url, json={"embeds": [embed]}, timeout=(5, TIMEOUT)
             )
@@ -1642,8 +1669,12 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
             if resposta.status_code == 429:
                 corpo = resposta.json() if resposta.content else {}
                 espera = float(corpo.get("retry_after", 5))
-                log.warning("Limite do Discord atingido. Esperando %.1fs...", espera)
-                time.sleep(espera + 1)
+                limitados += 1
+                if limitados <= 8:
+                    tentativa -= 1      # limite de taxa nao e erro: nao gasta tentativa
+                log.warning("Limite do Discord atingido (%sa vez). Esperando %.1fs...",
+                            limitados, espera)
+                time.sleep(espera + 0.2)
                 continue
 
             # Conteudo recusado (ex.: foto com endereco invalido). Melhor avisar
@@ -2192,43 +2223,7 @@ ENVIO_MANUAL_QTD = 5
 # Ficam atras de qualquer lancamento novo na fila e valem por mais tempo que o
 # normal. Depois do prazo esta lista nao faz nada — pode ser apagada.
 ENVIO_MANUAL_IDS_ATE = datetime(2026, 10, 9, 10, 45, tzinfo=timezone.utc)
-ENVIO_MANUAL_IDS = (
-    "233968388980142080", "233971051201359873", "234221982337789952",
-    "234225254326923264", "234225585484001280", "234226232124043265",
-    "234230766028255232", "234231884569440256", "234232633177206785",
-    "234234991214915585", "234241800327720960", "234242473752588288",
-    "234244116451749889", "234245249861742592", "234246003733360640",
-    "234250460776951808", "234250711080431617", "234250812393844736",
-    "234251045697810432", "234251343468228608", "234251556329156609",
-    "234252532163342336", "234252541613109248", "234252925626806273",
-    "234254156864745473", "234254435202953217", "234255607267651585",
-    "234255844665257985", "234256332022411265", "234256865999253505",
-    "234256951768576001", "234258680597770240", "234258716798808064",
-    "234259001625604097", "234259495395848193", "234259544146243585",
-    "234259927434326017", "234259961118781440", "234261761074982912",
-    "234262070690115585", "234262140302979072", "234263251105673216",
-    "234264294220689408", "234264797444894720", "234265038994862081",
-    "234265203369635841", "234265397217783808", "234265627870949376",
-    "234266386947698689", "234266469634207745", "234266547937669121",
-    "234266963907768320", "234267081050484736", "234270601547935744",
-    "234271231121354752", "234271527864168449", "234272202228559872",
-    "234272310986862592", "234272722871709696", "234274683075489792",
-    "234275487341670401", "234275733077553152", "234275846583808000",
-    "234276086275698688", "234276162809163776", "234276576669528064",
-    "234276847390879745", "234278329913765889", "234278432623882240",
-    "234278712312655872", "234279149845671936", "234279303856320513",
-    "234279710808666112", "234279949590392833", "234280030280413185",
-    "234280681592909824", "234280811133988864", "234281456809340929",
-    "234281999984291840", "234282298341912577", "234282875524280320",
-    "234283220421898240", "234283687470231553", "234283903564967937",
-    "234316882836254721", "234317240887209985", "234317481732534272",
-    "234317661034835968", "234317755272458240", "234318067483865088",
-    "234318229333667840", "234318552961970176", "234319140294553600",
-    "234344180440428544", "234350147785781248", "234350759847981057",
-    "234350797236006912", "234350835408367616", "234350880128036864",
-    "234357828416237568", "234358136525615104", "234360890585313281",
-    "234361686462885889",
-)
+ENVIO_MANUAL_IDS = ()   # lista de 09/10 ja enviada; esvaziada para um reinicio nao repostar
 
 # Pausa do Telegram depois de falhas seguidas (ver rodar_coleta)
 _telegram_pausa = {"ate": 0.0}
@@ -3109,6 +3104,9 @@ def main() -> None:
 
     config = carregar_config()
     testar_rede()
+    log.info("MEMORIA DO BOT em %s — %s.", os.path.abspath(BANCO_DADOS),
+             "arquivo ja existe: continua de onde parou" if os.path.exists(BANCO_DADOS)
+             else "arquivo NOVO (vazio): o bot comeca do zero")
 
     if argumentos.testar:
         if not testar_notificacao(config):
