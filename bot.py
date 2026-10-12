@@ -809,9 +809,16 @@ def limpar_falha_rede() -> None:
 
 def _buscar_pagina(sessao: requests.Session, categoria: str, numero: int):
     """Busca UMA pagina. Devolve (numero, registros) ou (numero, None)."""
+    # orderBy=id: do produto MAIS NOVO para o mais antigo. Sem isso, a API passou
+    # (entre 09/10 e 11/10/2026) a devolver a lista em ORDEM ALEATORIA a cada
+    # chamada: a leitura rapida deixava de ver os lancamentos (so os achava por
+    # sorteio) e, apos qualquer reinicio, a primeira rodada semeava 1000 itens
+    # sorteados de todo o catalogo (piso baixo) e depois anunciava itens ANTIGOS
+    # como se fossem novos.
     parametros = {
         "fields": 1, "categoryId": categoria, "page": numero,
         "pageSize": TAMANHO_PAGINA, "priceMin": "0.00", "priceMax": "99999.00",
+        "orderBy": "id",
     }
     try:
         resposta = sessao.get(API_PRODUTOS, params=parametros, timeout=TIMEOUT_CATALOGO)
