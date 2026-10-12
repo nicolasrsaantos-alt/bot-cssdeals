@@ -308,6 +308,14 @@ LIMITE_TEXTO_TRADUCAO = 480   # o MyMemory aceita ate ~500 caracteres por vez
 # outro que continua dizendo claramente que e um monitor automatico. NAO
 # imita navegador. Se este nome tambem for barrado, a saida e a autorizacao
 # do CSSBuy/CSSDeals (API oficial), nao disfarce.
+# Aviso no topo de cada mensagem: distingue LANCAMENTO (produto novo no CSSDeals)
+# de VOLTOU AO ESTOQUE (produto que ja existia, esgotou — ex.: comprado e devolvido —
+# e voltou a ter unidade). Para mudar o texto, e so editar aqui.
+TAG_LANCAMENTO = "\U0001F195 LAN\u00c7AMENTO"
+TAG_REESTOQUE = "\u267B\uFE0F VOLTOU AO ESTOQUE"
+COR_LANCAMENTO = 0x00B37E     # verde
+COR_REESTOQUE = 0xF5A623      # laranja
+
 USER_AGENT = "ColetaPessoal/1.0 (monitor de lancamentos para uso pessoal)"
 
 
@@ -396,6 +404,7 @@ def abrir_banco() -> sqlite3.Connection:
     # Adiciona sem apagar nada do que ja estava salvo.
     colunas = [c[1] for c in conexao.execute("PRAGMA table_info(itens)")]
     for nome, tipo in (("tamanho", "TEXT"), ("grupo", "TEXT"),
+                       ("estoque", "INTEGER"), ("tipo", "TEXT DEFAULT 'lancamento'"),
                        ("tg_ok", "INTEGER DEFAULT 0"),
                        ("discord_ok", "INTEGER DEFAULT 0"),
                        ("canal_ok", "INTEGER DEFAULT 0")):
@@ -436,8 +445,8 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
         INSERT OR IGNORE INTO itens
             (id, titulo, titulo_pt, tamanho, imagem, link, preco, categoria,
              plataforma, origem, visto_em, notificado, grupo,
-             tg_ok, discord_ok, canal_ok)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             tg_ok, discord_ok, canal_ok, estoque, tipo)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             item["id"], item["titulo"], item.get("titulo_pt", ""),
@@ -448,9 +457,44 @@ def salvar_item(conexao: sqlite3.Connection, item: dict,
             1 if ja_notificado else 0,
             item.get("grupo", "OUTROS"),
             tudo_ok, tudo_ok, tudo_ok,
+            item.get("estoque"), item.get("tipo", "lancamento"),
         ),
     )
     conexao.commit()
+
+
+def atualizar_estoques(conexao: sqlite3.Connection, itens: list) -> list:
+    """
+    Compara o estoque de cada item JA CONHECIDO com o que o banco guardou.
+
+    Estoque que ia de 0 para mais de 0 = o produto VOLTOU (ex.: foi comprado no
+    CSSDeals e devolvido). Esses itens voltam para a fila de avisos marcados como
+    "reestoque". Tambem mantem o estoque guardado em dia, para a proxima
+    comparacao. Item desconhecido ou sem estoque guardado (banco antigo) so tem o
+    estoque anotado — nunca gera aviso.
+    """
+    guardado = dict(conexao.execute("SELECT id, estoque FROM itens"))
+    agora = datetime.now().isoformat(timespec="seconds")
+    voltaram = []
+    for item in itens:
+        id_ = item["id"]
+        novo = item.get("estoque")
+        if novo is None or id_ not in guardado:
+            continue
+        antes = guardado[id_]
+        if antes == novo:
+            continue
+        if antes == 0 and novo > 0:
+            conexao.execute(
+                "UPDATE itens SET estoque = ?, tipo = 'reestoque', notificado = 0, "
+                "tg_ok = 0, discord_ok = 0, canal_ok = 0, visto_em = ? WHERE id = ?",
+                (novo, agora, id_))
+            item["tipo"] = "reestoque"
+            voltaram.append(item)
+        else:
+            conexao.execute("UPDATE itens SET estoque = ? WHERE id = ?", (novo, id_))
+    conexao.commit()
+    return voltaram
 
 
 def guardar_piso(conexao: sqlite3.Connection, ids: list) -> int:
@@ -515,7 +559,7 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
     cursor = conexao.execute(
         """
         SELECT id, titulo, titulo_pt, tamanho, imagem, link, preco,
-               categoria, plataforma, origem, grupo, tg_ok, discord_ok, canal_ok
+               categoria, plataforma, origem, grupo, tg_ok, discord_ok, canal_ok, tipo
         FROM itens WHERE notificado = 0 ORDER BY visto_em, rowid
         """
     )
@@ -524,6 +568,7 @@ def buscar_pendentes(conexao: sqlite3.Connection) -> list:
          "imagem": l[4], "link": l[5], "preco": l[6], "categoria": l[7],
          "plataforma": l[8], "origem": l[9], "grupo": l[10] or "OUTROS",
          "compra": URL_COMPRA.format(id=l[0]) + _extra_compra,
+         "tipo": l[14] or "lancamento",
          "_tg_ok": bool(l[11]), "_discord_ok": bool(l[12]), "_canal_ok": bool(l[13])}
         for l in cursor.fetchall()
     ]
@@ -1457,7 +1502,9 @@ def titulo_visivel(item: dict) -> str:
 
 def montar_texto_telegram(item: dict) -> str:
     """Monta a mensagem no formato HTML do Telegram (negrito, link clicavel)."""
-    linhas = ["\U0001F195 <b>{}</b>".format(escapar_html(titulo_visivel(item)))]
+    reestoque = item.get("tipo") == "reestoque"
+    linhas = ["<b>{}</b>".format(TAG_REESTOQUE if reestoque else TAG_LANCAMENTO),
+              "<b>{}</b>".format(escapar_html(titulo_visivel(item)))]
 
     # Tamanho vem logo abaixo do nome. Se o produto nao tiver, a linha
     # simplesmente nao aparece.
@@ -1633,16 +1680,17 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
 
     O Discord monta um card bonito (embed) com titulo, link e foto.
     """
+    reestoque = item.get("tipo") == "reestoque"
     embed = {
         "title": titulo_visivel(item)[:250],
-        "color": 0x00B37E,   # verdinho
+        "color": COR_REESTOQUE if reestoque else COR_LANCAMENTO,
     }
     if item.get("link"):
         embed["url"] = item["link"]
     if item.get("imagem"):
         embed["image"] = {"url": item["imagem"]}
 
-    detalhes = []
+    detalhes = ["**{}**".format(TAG_REESTOQUE if reestoque else TAG_LANCAMENTO)]
     if item.get("tamanho"):
         detalhes.append("**Tamanho:** {}".format(item["tamanho"]))
     original = item["titulo"]
@@ -1801,6 +1849,8 @@ def carregar_config() -> dict:
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
         "varredura_seg": _inteiro_do_ambiente(
             "SEGUNDOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_SEG, minimo=5),
+        # Paginas do resto do catalogo lidas por rodada para acompanhar estoque (0 = desliga)
+        "estoque_paginas": _inteiro_do_ambiente("PAGINAS_DE_ESTOQUE_POR_RODADA", 1, minimo=0),
         "profunda_seg": _inteiro_do_ambiente(
             "VARREDURA_PROFUNDA_SEG", VARREDURA_PROFUNDA_PADRAO_SEG, minimo=5),
         "mostrar_real": os.getenv("MOSTRAR_REAL", "nao").strip().lower()
@@ -1890,6 +1940,34 @@ def carregar_config() -> dict:
 #  8. RODADA DE COLETA
 # ==========================================================================
 
+# Pagina do catalogo (alem das 10 da varredura profunda) que sera lida na proxima
+# rodada. O bot le UMA por rodada e da a volta no catalogo inteiro (~83 paginas,
+# cerca de 9 min), so para acompanhar o estoque de produtos antigos: e assim que
+# ele percebe um produto antigo que foi devolvido e voltou a ter unidade.
+_cursor_estoque = {"pagina": PAGINAS_PROFUNDAS + 1}
+
+
+def varredura_de_estoque(sessao, conexao, config: dict, piso: int) -> list:
+    """Le a proxima pagina do catalogo e devolve os itens que VOLTARAM ao estoque."""
+    quantas = config.get("estoque_paginas", 0)
+    voltaram = []
+    for _ in range(quantas):
+        pagina = _cursor_estoque["pagina"]
+        _, registros = _buscar_pagina(sessao, config["categoria"], pagina)
+        if registros is DESAFIO or registros is None:
+            return voltaram                 # a leitura principal ja trata o recuo
+        if len(registros) < TAMANHO_PAGINA:
+            _cursor_estoque["pagina"] = PAGINAS_PROFUNDAS + 1      # fim: recomeca
+        else:
+            _cursor_estoque["pagina"] = pagina + 1
+        itens = [i for i in map(montar_item, registros) if i]
+        for item in itens:                 # produto antigo ainda nao conhecido: so anota
+            if int(item["id"]) < piso and not item_ja_existe(conexao, item["id"]):
+                salvar_item(conexao, item, ja_notificado=True)
+        voltaram += atualizar_estoques(conexao, itens)
+    return voltaram
+
+
 def escolher_para_envio_manual(itens: list, quantos: int) -> list:
     """
     Escolhe os `quantos` produtos mais novos que ainda existem e tem estoque.
@@ -1943,6 +2021,9 @@ def rodar_coleta(config: dict) -> None:
 
     # Passo 2: converter para o formato do bot
     itens = extrair_itens(registros)
+    # Tambem os ESGOTADOS: o bot precisa saber que existem para perceber quando
+    # voltam ao estoque (a lista do site mantem produtos com estoque 0).
+    todos = [i for i in map(montar_item, registros) if i]
     log.info("Produtos lidos nesta rodada: %s", len(itens))
 
     if not itens:
@@ -2002,6 +2083,9 @@ def rodar_coleta(config: dict) -> None:
                 salvar_item(conexao, item, ja_notificado=False, visto_em=atras)
         if recuperados:
             log.info("%s item(ns) recente(s) ficaram na fila para serem anunciados.", recuperados)
+        for item in todos:
+            if item.get("estoque") == 0:       # esgotados: so para acompanhar o estoque
+                salvar_item(conexao, item, ja_notificado=True)
         piso = guardar_piso(conexao, [i["id"] for i in itens])
         log.info("Janela de referencia: produtos criados desde %s.",
                  (EPOCH_ID + timedelta(milliseconds=piso >> 22)).astimezone(
@@ -2032,6 +2116,14 @@ def rodar_coleta(config: dict) -> None:
             continue
         salvar_item(conexao, item)      # salva na hora (incremental)
         novos.append(item)
+
+    for item in todos:                          # esgotados ainda desconhecidos: so anota
+        if item.get("estoque") == 0 and not item_ja_existe(conexao, item["id"]):
+            salvar_item(conexao, item, ja_notificado=True)
+    voltaram = atualizar_estoques(conexao, todos)
+    voltaram += varredura_de_estoque(sessao, conexao, config, piso)
+    if voltaram:
+        log.info("VOLTARAM AO ESTOQUE: %s item(ns).", len(voltaram))
 
     if deslizaram:
         log.info("Ignorados %s produto(s) ANTIGOS que entraram na janela por baixo "
