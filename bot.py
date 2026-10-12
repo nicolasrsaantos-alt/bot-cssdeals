@@ -1849,6 +1849,9 @@ def carregar_config() -> dict:
         "intervalo": _inteiro_do_ambiente("INTERVALO_SEGUNDOS", INTERVALO_PADRAO),
         "varredura_seg": _inteiro_do_ambiente(
             "SEGUNDOS_ENTRE_VARREDURAS", VARREDURA_PADRAO_SEG, minimo=5),
+        # Aviso privado so dos "voltou ao estoque" (ficam so nas Variables do Railway)
+        "aviso_privado_discord": os.getenv("AVISO_PRIVADO_DISCORD_WEBHOOK", "").strip(),
+        "aviso_privado_telegram": os.getenv("AVISO_PRIVADO_TELEGRAM_CHAT_ID", "").strip(),
         # Paginas do resto do catalogo lidas por rodada para acompanhar estoque (0 = desliga)
         "estoque_paginas": _inteiro_do_ambiente("PAGINAS_DE_ESTOQUE_POR_RODADA", 1, minimo=0),
         "profunda_seg": _inteiro_do_ambiente(
@@ -1928,6 +1931,11 @@ def carregar_config() -> dict:
              _hora_local(config["fuso"]).strftime("%H:%M"),
              "" if em_horario_de_pico(config) else "NAO ")
 
+    privados = [n for n, v in (("Discord", config["aviso_privado_discord"]),
+                               ("Telegram", config["aviso_privado_telegram"])) if v]
+    log.info("Aviso privado de VOLTOU AO ESTOQUE: %s.",
+             "ligado (" + " + ".join(privados) + ")" if privados else "desligado")
+
     if config["traduzir"]:
         log.info("Traducao dos titulos para portugues: LIGADA.")
     else:
@@ -1966,6 +1974,20 @@ def varredura_de_estoque(sessao, conexao, config: dict, piso: int) -> list:
                 salvar_item(conexao, item, ja_notificado=True)
         voltaram += atualizar_estoques(conexao, itens)
     return voltaram
+
+
+# Aviso PRIVADO ao dono: copia so dos itens "VOLTOU AO ESTOQUE", para um canal
+# privado dele (AVISO_PRIVADO_DISCORD_WEBHOOK e/ou AVISO_PRIVADO_TELEGRAM_CHAT_ID).
+# Existe porque entram muitos itens por dia nos grupos e ele nao consegue acompanhar
+# a mao. Cada item avisa uma vez por execucao do bot.
+_avisados_privado = set()
+
+
+def avisar_privado(item: dict, config: dict) -> None:
+    if config.get("aviso_privado_discord"):
+        enviar_discord(item, config["aviso_privado_discord"])
+    if config.get("aviso_privado_telegram") and config.get("telegram_token"):
+        enviar_telegram(item, config["telegram_token"], config["aviso_privado_telegram"])
 
 
 def escolher_para_envio_manual(itens: list, quantos: int) -> list:
@@ -2230,6 +2252,13 @@ def rodar_coleta(config: dict) -> None:
         # ate ~18s numa leva grande, e tempo de sobra para um produto de 1
         # unidade (98% deles) esgotar entre a conferencia em lote (acima) e
         # a vez de cada item aqui.
+        # Copia privada dos "voltou ao estoque" para o dono (antes da fila lenta do Telegram)
+        if config.get("aviso_privado_discord") or config.get("aviso_privado_telegram"):
+            for item in a_enviar:
+                if item.get("tipo") == "reestoque" and item["id"] not in _avisados_privado:
+                    _avisados_privado.add(item["id"])
+                    avisar_privado(item, config)
+
         tem_telegram = bool(config["telegram_token"] and config["telegram_chat_id"])
         fila_telegram = [item for item in a_enviar
                          if tem_telegram and not status_item[item["id"]]["tg_ok"]]
