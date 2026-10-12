@@ -405,6 +405,7 @@ def abrir_banco() -> sqlite3.Connection:
     colunas = [c[1] for c in conexao.execute("PRAGMA table_info(itens)")]
     for nome, tipo in (("tamanho", "TEXT"), ("grupo", "TEXT"),
                        ("estoque", "INTEGER"), ("tipo", "TEXT DEFAULT 'lancamento'"),
+                       ("ausencias", "INTEGER DEFAULT 0"), ("ausente", "INTEGER DEFAULT 0"),
                        ("tg_ok", "INTEGER DEFAULT 0"),
                        ("discord_ok", "INTEGER DEFAULT 0"),
                        ("canal_ok", "INTEGER DEFAULT 0")):
@@ -493,6 +494,47 @@ def atualizar_estoques(conexao: sqlite3.Connection, itens: list) -> list:
             voltaram.append(item)
         else:
             conexao.execute("UPDATE itens SET estoque = ? WHERE id = ?", (novo, id_))
+    conexao.commit()
+    return voltaram
+
+
+AUSENCIAS_PARA_SUMIDO = 3     # varreduras profundas seguidas sem ver o item (~1 min)
+
+
+def acompanhar_presenca(conexao: sqlite3.Connection, ids_vistos: set, completa: bool) -> list:
+    """
+    Percebe produto que SUMIU da lista e VOLTOU (ex.: comprado e devolvido, ou
+    reservado num carrinho e liberado) — o jeito mais comum de um item "voltar ao
+    estoque": ele some do catalogo e reaparece com o MESMO id.
+
+    So olha a faixa de ids da varredura profunda e so quando ela veio COMPLETA.
+    Um item so vira "sumido" depois de AUSENCIAS_PARA_SUMIDO varreduras seguidas sem
+    aparecer (uma falha isolada, como a lista deslizar entre duas paginas, nao conta).
+    Devolve os ids que reapareceram e voltaram para a fila como "reestoque".
+    """
+    if not completa or not ids_vistos:
+        return []
+    numericos = [int(i) for i in ids_vistos]
+    menor, maior = min(numericos), max(numericos)
+    agora = datetime.now().isoformat(timespec="seconds")
+    voltaram = []
+    linhas = conexao.execute(
+        "SELECT id, ausencias, ausente FROM itens "
+        "WHERE CAST(id AS INTEGER) BETWEEN ? AND ?", (menor, maior)).fetchall()
+    for id_, ausencias, ausente in linhas:
+        if id_ in ids_vistos:
+            if ausente:
+                conexao.execute(
+                    "UPDATE itens SET tipo = 'reestoque', notificado = 0, tg_ok = 0, "
+                    "discord_ok = 0, canal_ok = 0, visto_em = ?, ausencias = 0, ausente = 0 "
+                    "WHERE id = ?", (agora, id_))
+                voltaram.append(id_)
+            elif ausencias:
+                conexao.execute("UPDATE itens SET ausencias = 0 WHERE id = ?", (id_,))
+        elif not ausente:               # ja marcado como sumido: nada a atualizar
+            ausencias = (ausencias or 0) + 1
+            conexao.execute("UPDATE itens SET ausencias = ?, ausente = ? WHERE id = ?",
+                            (ausencias, 1 if ausencias >= AUSENCIAS_PARA_SUMIDO else 0, id_))
     conexao.commit()
     return voltaram
 
@@ -2109,6 +2151,9 @@ def rodar_coleta(config: dict) -> None:
             if item.get("estoque") == 0:       # esgotados: so para acompanhar o estoque
                 salvar_item(conexao, item, ja_notificado=True)
         piso = guardar_piso(conexao, [i["id"] for i in itens])
+        conexao.execute("INSERT OR REPLACE INTO meta (chave, valor) VALUES ('semeado_em', ?)",
+                        (str(time.time()),))
+        conexao.commit()
         log.info("Janela de referencia: produtos criados desde %s.",
                  (EPOCH_ID + timedelta(milliseconds=piso >> 22)).astimezone(
                      timezone(timedelta(hours=-3))).strftime("%d/%m/%Y"))
@@ -2125,10 +2170,23 @@ def rodar_coleta(config: dict) -> None:
 
     # Passo 4: separar o que e realmente novo
     piso = obter_piso(conexao)
+    # Maior id que o bot ja conhece: lancamento de verdade tem id MAIOR que ele (o id
+    # carrega a hora de criacao). Produto desconhecido com id MENOR ja existiu antes e
+    # reapareceu — voltou ao estoque.
+    linha_max = conexao.execute("SELECT MAX(CAST(id AS INTEGER)) FROM itens").fetchone()
+    maior_conhecido = int(linha_max[0]) if linha_max and linha_max[0] else 0
+    # Nos 2 primeiros minutos depois de semear, produto desconhecido com id ANTIGO e quase
+    # sempre um que a propria semeadura perdeu (a lista desliza entre uma pagina e outra
+    # enquanto e lida) — nao e retorno ao estoque, so anota em silencio.
+    linha_sem = conexao.execute("SELECT valor FROM meta WHERE chave = 'semeado_em'").fetchone()
+    carencia = bool(linha_sem) and (time.time() - float(linha_sem[0])) < 120
     novos = []
     deslizaram = 0
     for item in itens:
         if item_ja_existe(conexao, item["id"]):
+            continue
+        if carencia and maior_conhecido and int(item["id"]) < maior_conhecido:
+            salvar_item(conexao, item, ja_notificado=True)
             continue
         if piso and int(item["id"]) < piso:
             # Mais velho que tudo o que o bot viu na partida: so entrou na
@@ -2136,6 +2194,8 @@ def rodar_coleta(config: dict) -> None:
             salvar_item(conexao, item, ja_notificado=True)
             deslizaram += 1
             continue
+        if maior_conhecido and int(item["id"]) < maior_conhecido:
+            item["tipo"] = "reestoque"
         salvar_item(conexao, item)      # salva na hora (incremental)
         novos.append(item)
 
@@ -2143,6 +2203,10 @@ def rodar_coleta(config: dict) -> None:
         if item.get("estoque") == 0 and not item_ja_existe(conexao, item["id"]):
             salvar_item(conexao, item, ja_notificado=True)
     voltaram = atualizar_estoques(conexao, todos)
+    reapareceram = acompanhar_presenca(
+        conexao, {i["id"] for i in todos},
+        profunda and len(registros) >= PAGINAS_PROFUNDAS * TAMANHO_PAGINA - 20)
+    voltaram += [{"id": i} for i in reapareceram]
     voltaram += varredura_de_estoque(sessao, conexao, config, piso)
     if voltaram:
         log.info("VOLTARAM AO ESTOQUE: %s item(ns).", len(voltaram))
