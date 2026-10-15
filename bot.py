@@ -301,6 +301,7 @@ _foto_escolhida = FOTO_PADRAO
 # mensagens extras vinham sem texto nem link). 1 = so a foto principal, como antes. Acima de
 # 4, o que passar vai em mensagens seguidas "Mais fotos" (4 por vez).
 MAX_FOTOS_DISCORD_PADRAO = 3
+FOTOS_TETO_DISCORD = 3
 _max_fotos_discord = MAX_FOTOS_DISCORD_PADRAO
 IDIOMA_DESTINO = "pt-BR"
 DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
@@ -1733,7 +1734,9 @@ def _fotos_do_item(item: dict) -> list:
     """Foto principal primeiro, depois as outras do anuncio (sem repetir), no limite configurado."""
     principal = item.get("imagem") or ""
     todas = ([principal] if principal else []) + [f for f in (item.get("fotos") or []) if f != principal]
-    return todas[:max(1, _max_fotos_discord)]
+    # Teto FIXO de 3 fotos (pedido do Nicolas em 15/10/2026), mesmo que a variavel
+    # MAX_FOTOS_DISCORD do Railway diga mais: nunca mais mensagens "Mais fotos".
+    return todas[:max(1, min(_max_fotos_discord, FOTOS_TETO_DISCORD))]
 
 
 def _embeds_de_fotos_extras(item: dict, embed: dict) -> list:
@@ -2030,8 +2033,8 @@ def carregar_config() -> dict:
     else:
         log.info("Sem codigo de indicacao — links de compra sem comissao.")
     log.info("Foto usada nos avisos: a %sa do anuncio.", _foto_escolhida + 1)
-    log.info("Discord: ate %s foto(s) por item%s.", _max_fotos_discord,
-             " (so a principal)" if _max_fotos_discord == 1 else "")
+    log.info("Discord: ate %s foto(s) por item, todas no proprio card.",
+             max(1, min(_max_fotos_discord, FOTOS_TETO_DISCORD)))
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
     from datetime import timedelta as _td
     def _hhmm(m): return "%02d:%02d" % (m // 60, m % 60)
