@@ -295,6 +295,11 @@ _mostrar_real = False
 
 # Indice da foto usada nos avisos (definido em carregar_config)
 _foto_escolhida = FOTO_PADRAO
+
+# Quantas fotos de cada item vao para o DISCORD (o card mostra ate 4 juntas; o que passar
+# disso vai em mensagens seguidas, 4 por vez). 1 = so a foto principal, como antes.
+MAX_FOTOS_DISCORD_PADRAO = 20
+_max_fotos_discord = MAX_FOTOS_DISCORD_PADRAO
 IDIOMA_DESTINO = "pt-BR"
 DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
 LIMITE_TEXTO_TRADUCAO = 480   # o MyMemory aceita ate ~500 caracteres por vez
@@ -1294,6 +1299,12 @@ def aplicar_fotos(itens: list, conexao=None) -> list:
         if fotos:
             escolhida = (fotos[_foto_escolhida] if _foto_escolhida < len(fotos)
                          else fotos[-1]) + REDIMENSIONA_FOTO
+            # Todas as fotos do anuncio (sem repetir, na ordem), ja redimensionadas.
+            vistas = []
+            for f in fotos:
+                if f + REDIMENSIONA_FOTO not in vistas:
+                    vistas.append(f + REDIMENSIONA_FOTO)
+            item["fotos"] = vistas
             if escolhida != item.get("imagem"):
                 item["imagem"] = escolhida
                 trocadas += 1
@@ -1716,6 +1727,55 @@ def _esperar_vez_do_webhook(url: str) -> None:
         _webhook_ultimo[url] = time.time()
 
 
+def _fotos_do_item(item: dict) -> list:
+    """Foto principal primeiro, depois as outras do anuncio (sem repetir), no limite configurado."""
+    principal = item.get("imagem") or ""
+    todas = ([principal] if principal else []) + [f for f in (item.get("fotos") or []) if f != principal]
+    return todas[:max(1, _max_fotos_discord)]
+
+
+def _embeds_de_fotos_extras(item: dict, embed: dict) -> list:
+    """
+    Fotos 2, 3 e 4 como embeds extras COM A MESMA url do card: o Discord junta os embeds
+    de mesma url numa galeria unica (ate 4 imagens lado a lado). Sem link, nao ha como juntar.
+    """
+    if not embed.get("url"):
+        return []
+    return [{"url": embed["url"], "image": {"url": f}} for f in _fotos_do_item(item)[1:4]]
+
+
+def enviar_fotos_extras(item: dict, webhook_url: str) -> None:
+    """
+    Fotos alem das 4 do card, em mensagens seguidas (4 por vez, mesma galeria).
+    Se falhar, so registra: o aviso principal ja foi entregue e nao pode ser repetido.
+    """
+    link = item.get("link")
+    restantes = _fotos_do_item(item)[4:]
+    if not link or not restantes:
+        return
+    titulo = titulo_visivel(item)[:80]
+    for i in range(0, len(restantes), 4):
+        lote = restantes[i:i + 4]
+        carga = {"content": "\U0001F4F7 Mais fotos: {}".format(titulo),
+                 "embeds": [{"url": link, "image": {"url": f}} for f in lote],
+                 "allowed_mentions": {"parse": []}}
+        for tentativa in range(3):
+            try:
+                _esperar_vez_do_webhook(webhook_url)
+                resposta = requests.post(webhook_url, json=carga, timeout=(5, TIMEOUT))
+                if resposta.status_code in (200, 204):
+                    break
+                if resposta.status_code == 429:
+                    espera = float((resposta.json() if resposta.content else {}).get("retry_after", 3))
+                    time.sleep(espera + 0.2)
+                    continue
+                log.warning("Discord recusou as fotos extras (%s): %s", resposta.status_code, resposta.text[:200])
+                break
+            except requests.exceptions.RequestException as erro:
+                log.warning("Falha ao enviar fotos extras ao Discord: %s", str(erro)[:80])
+                time.sleep(1)
+
+
 def enviar_discord(item: dict, webhook_url: str) -> bool:
     """
     Envia UM item para o canal do Discord usando um Webhook.
@@ -1749,6 +1809,7 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
     if detalhes:
         embed["description"] = "\n".join(detalhes)
 
+    carga = {"embeds": [embed] + _embeds_de_fotos_extras(item, embed)}
     tentativa = 0
     limitados = 0
     while tentativa < MAX_TENTATIVAS:
@@ -1756,7 +1817,7 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
         try:
             _esperar_vez_do_webhook(webhook_url)
             resposta = requests.post(
-                webhook_url, json={"embeds": [embed]}, timeout=(5, TIMEOUT)
+                webhook_url, json=carga, timeout=(5, TIMEOUT)
             )
 
             if resposta.status_code in (200, 204):
@@ -1778,6 +1839,9 @@ def enviar_discord(item: dict, webhook_url: str) -> bool:
             # sem a foto do que nao avisar: tira a imagem e, se preciso, o link.
             if resposta.status_code == 400:
                 log.warning("Discord recusou o conteudo (400): %s", resposta.text[:300])
+                if len(carga["embeds"]) > 1:           # galeria com problema: so o card
+                    carga["embeds"] = carga["embeds"][:1]
+                    continue
                 if "image" in embed:
                     embed.pop("image")
                     continue
@@ -1902,6 +1966,8 @@ def carregar_config() -> dict:
                         in ("sim", "yes", "1", "true"),
         # 0 = primeira foto do anuncio, 1 = segunda, e assim por diante
         "foto": _inteiro_do_ambiente("FOTO_DO_ANUNCIO", FOTO_PADRAO, minimo=0),
+        # Fotos por item no Discord (1 = so a principal; padrao 20 = todas)
+        "max_fotos_discord": _inteiro_do_ambiente("MAX_FOTOS_DISCORD", MAX_FOTOS_DISCORD_PADRAO, minimo=1),
         "pico_inicio": _para_minutos(os.getenv("PICO_INICIO", PICO_INICIO_PADRAO), PICO_INICIO_PADRAO),
         "pico_fim": _para_minutos(os.getenv("PICO_FIM", PICO_FIM_PADRAO), PICO_FIM_PADRAO),
         "pico_segundos": _inteiro_do_ambiente("PICO_SEGUNDOS", PICO_SEGUNDOS_PADRAO, minimo=5),
@@ -1947,9 +2013,10 @@ def carregar_config() -> dict:
     else:
         log.info("Monitorando lancamentos de TODAS as abas do site.")
 
-    global _mostrar_real, _foto_escolhida, _extra_compra
+    global _mostrar_real, _foto_escolhida, _extra_compra, _max_fotos_discord
     _mostrar_real = config["mostrar_real"]
     _foto_escolhida = config["foto"]
+    _max_fotos_discord = config["max_fotos_discord"]
 
     # Garante que comece com & ou ?, para nao grudar no parametro anterior
     extra = config["cssbuy_extra"]
@@ -1961,6 +2028,8 @@ def carregar_config() -> dict:
     else:
         log.info("Sem codigo de indicacao — links de compra sem comissao.")
     log.info("Foto usada nos avisos: a %sa do anuncio.", _foto_escolhida + 1)
+    log.info("Discord: ate %s foto(s) por item%s.", _max_fotos_discord,
+             " (so a principal)" if _max_fotos_discord == 1 else "")
     log.info("Precos em Yuan%s.", " + reais" if _mostrar_real else " (CN¥)")
     from datetime import timedelta as _td
     def _hhmm(m): return "%02d:%02d" % (m // 60, m % 60)
@@ -2293,11 +2362,15 @@ def rodar_coleta(config: dict) -> None:
 
             if tem_geral and not discord_ok:
                 discord_ok = enviar_discord(item, config["discord_webhook"])
+                if discord_ok:
+                    enviar_fotos_extras(item, config["discord_webhook"])
                 if not discord_ok:
                     log.warning("Discord (canal geral) NAO recebeu (vai tentar de novo): %s",
                                item["titulo"][:50])
             if webhook_canal and not canal_ok:
                 canal_ok = enviar_discord(item, webhook_canal)
+                if canal_ok:
+                    enviar_fotos_extras(item, webhook_canal)
                 if not canal_ok:
                     log.warning("Discord/%s NAO recebeu (vai tentar de novo): %s",
                                NOME_GRUPO.get(item.get("grupo", ""), item.get("grupo")),
