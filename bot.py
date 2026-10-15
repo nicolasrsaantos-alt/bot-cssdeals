@@ -296,9 +296,11 @@ _mostrar_real = False
 # Indice da foto usada nos avisos (definido em carregar_config)
 _foto_escolhida = FOTO_PADRAO
 
-# Quantas fotos de cada item vao para o DISCORD (o card mostra ate 4 juntas; o que passar
-# disso vai em mensagens seguidas, 4 por vez). 1 = so a foto principal, como antes.
-MAX_FOTOS_DISCORD_PADRAO = 20
+# Quantas fotos de cada item vao para o DISCORD, todas JUNTAS no proprio card (com titulo,
+# preco e links). Pedido do Nicolas em 15/10/2026: so 3 (com 20 chegavam fotos demais e as
+# mensagens extras vinham sem texto nem link). 1 = so a foto principal, como antes. Acima de
+# 4, o que passar vai em mensagens seguidas "Mais fotos" (4 por vez).
+MAX_FOTOS_DISCORD_PADRAO = 3
 _max_fotos_discord = MAX_FOTOS_DISCORD_PADRAO
 IDIOMA_DESTINO = "pt-BR"
 DELAY_ENTRE_TRADUCOES = 0.5   # segundos entre traducoes (educacao com o servico)
